@@ -411,7 +411,7 @@ def main():
     world = World(args.cars)
     threading.Thread(target=world.loop, daemon=True).start()
     print(f"evacsim: {world.n_segs} roads, {args.cars} cars, http://localhost:{args.port}")
-    app.run(port=args.port, threaded=True)
+    app.run(host="0.0.0.0", port=args.port, threaded=True)
 
 
 if __name__ == "__main__":
