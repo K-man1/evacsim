@@ -116,14 +116,8 @@ def flooded_edges(net: Network, flood_geoms) -> np.ndarray:
     return flooded
 
 
-def build_scenario(net: Network, flood_geoms, district, home_areas, cars_per_area, area_group,
-                   departure_peak_s: float, safe_buffer_deg: float = 0.002, seed: int = 0) -> Scenario:
-    """Place cars on the streets of each home area; send them to the nearest dry arterial or exit.
-
-    `home_areas` are polygons where people live, `cars_per_area` the expected evacuating cars from each,
-    and `area_group` marks each area FLOOD_ZONE or SHADOW (outside the zone but leaving anyway).
-    """
-    rng = np.random.default_rng(seed)
+def safe_destinations(net: Network, flood_geoms, district, safe_buffer_deg: float = 0.002):
+    """Nodes that count as safe, and nodes a car can usefully start from."""
     points = [Point(xy) for xy in net.node_xy]
 
     # ~200 m at NJ latitudes. Dry ground means clear of the floodplain by a margin, not just past its edge.
@@ -144,7 +138,15 @@ def build_scenario(net: Network, flood_geoms, district, home_areas, cars_per_are
     reverse = csr_matrix((np.ones(net.n_edges), (net.v, net.u)), shape=(net.n_nodes, net.n_nodes))
     dist = dijkstra(reverse, indices=np.flatnonzero(destinations), min_only=True, unweighted=True)
     usable = np.isfinite(dist) & ~destinations
+    return destinations, usable
 
+
+def expected_cars(net: Network, usable, home_areas, cars_per_area, area_group) -> np.ndarray:
+    """Expected starting cars per node, one row per group (FLOOD_ZONE, SHADOW).
+
+    Linear in `cars_per_area`, so scaling a group's row scales that group's evacuation rate.
+    """
+    points = [Point(xy) for xy in net.node_xy]
     street = np.zeros(net.n_nodes)
     for e, cls in enumerate(net.highway):
         if cls in RESIDENTIAL:
@@ -167,16 +169,31 @@ def build_scenario(net: Network, flood_geoms, district, home_areas, cars_per_are
     nearest = usable_nodes[usable_tree.nearest([home_areas[a].representative_point() for a in empty])] \
         if len(empty) else np.array([], dtype=np.int64)
 
-    origins, group = [], []
+    expected = np.zeros((2, net.n_nodes))
     for g in (FLOOD_ZONE, SHADOW):
         cars = np.where(area_group == g, cars_per_area, 0.0)
-        expected = np.zeros(net.n_nodes)
-        np.add.at(expected, node_idx, cars[area_idx] * pair_weight / area_total[area_idx])
-        np.add.at(expected, nearest, cars[empty])
-        n = int(round(expected.sum()))
+        np.add.at(expected[g], node_idx, cars[area_idx] * pair_weight / area_total[area_idx])
+        np.add.at(expected[g], nearest, cars[empty])
+    return expected
+
+
+def build_scenario(net: Network, flood_geoms, district, home_areas, cars_per_area, area_group,
+                   departure_peak_s: float, safe_buffer_deg: float = 0.002, seed: int = 0) -> Scenario:
+    """Place cars on the streets of each home area; send them to the nearest dry arterial or exit.
+
+    `home_areas` are polygons where people live, `cars_per_area` the expected evacuating cars from each,
+    and `area_group` marks each area FLOOD_ZONE or SHADOW (outside the zone but leaving anyway).
+    """
+    rng = np.random.default_rng(seed)
+    destinations, usable = safe_destinations(net, flood_geoms, district, safe_buffer_deg)
+    expected = expected_cars(net, usable, home_areas, cars_per_area, area_group)
+
+    origins, group = [], []
+    for g in (FLOOD_ZONE, SHADOW):
+        n = int(round(expected[g].sum()))
         # Largest-remainder rounding: every intersection gets its expected count, not a random draw around it.
-        counts = np.floor(expected).astype(np.int64)
-        counts[np.argsort(counts - expected, kind="stable")[:n - counts.sum()]] += 1
+        counts = np.floor(expected[g]).astype(np.int64)
+        counts[np.argsort(counts - expected[g], kind="stable")[:n - counts.sum()]] += 1
         origins.append(np.repeat(np.arange(net.n_nodes), counts))
         group.append(np.full(n, g, dtype=np.int8))
     origins, group = np.concatenate(origins), np.concatenate(group)
