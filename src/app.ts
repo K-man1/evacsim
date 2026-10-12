@@ -1,86 +1,125 @@
-import { countUp, clickSpark } from "/static/bits.js";
+import { PathStyleExtension } from "@deck.gl/extensions";
+import type { GeoBoundingBox } from "@deck.gl/geo-layers";
+import {
+  BitmapLayer, Deck, FlyToInterpolator, GeoJsonLayer, PathLayer, ScatterplotLayer, TileLayer, WebMercatorViewport,
+  type Color, type MapViewState, type PickingInfo,
+} from "deck.gl";
+import type { Feature, FeatureCollection, Position } from "geojson";
 
-const { Deck, TileLayer, BitmapLayer, PathLayer, GeoJsonLayer, ScatterplotLayer, PathStyleExtension,
-  WebMercatorViewport, FlyToInterpolator } = deck;
+import { clickSpark, countUp } from "./bits.ts";
+import type { Warning } from "./sim.ts";
+import type { Command, FromWorker } from "./worker.ts";
+import type { NetworkJson, Snapshot, State, Stats } from "./world.ts";
+
+type Rgb = [number, number, number];
+type Road = { i: number; path: [number, number][]; cls: string; name: string; flags: number; storage: number; town: number };
+type Mode = "queues" | "delay" | "routes";
+type Tab = "overview" | "bottlenecks" | "towns" | "compare";
+type Summary = Stats["summary"];
+type TownRow = Stats["towns"][number];
+type Point = { t: number; pct: number };
 
 const FLAG_BRIDGE = 1, FLAG_FLOODED = 2;
-const ROAD_STYLE = {
+const ROAD_STYLE: Record<string, [Rgb, number]> = {
   motorway: [[74, 74, 74], 2.2], trunk: [[68, 68, 68], 2], primary: [[60, 60, 60], 1.8],
   secondary: [[52, 52, 52], 1.4], tertiary: [[44, 44, 44], 1.1],
 };
-const LOCAL_STYLE = [[34, 34, 34], 0.8];
+const LOCAL_STYLE: [Rgb, number] = [[34, 34, 34], 0.8];
 // Single-hue ordinal ramp validated against the dark map surface (dataviz validate_palette --ordinal).
-const RAMP = [[138, 58, 18], [201, 83, 29], [240, 122, 60], [255, 185, 140]];
-const CRITICAL = [208, 59, 59];
+const RAMP: Rgb[] = [[138, 58, 18], [201, 83, 29], [240, 122, 60], [255, 185, 140]];
+const CRITICAL: Rgb = [208, 59, 59];
 const ESRI = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas";
 
-const $ = (id) => document.getElementById(id);
-const fmt = (n) => Math.round(n).toLocaleString("en-US");
-const minutes = (m) => (m == null ? "—" : m < 10 ? m.toFixed(1) : String(Math.round(m)));
+const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
+const fmt = (n: number) => Math.round(n).toLocaleString("en-US");
+const minutes = (m: number | null) => (m == null ? "—" : m < 10 ? m.toFixed(1) : String(Math.round(m)));
 
-async function post(path, body) {
-  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body ?? {}) });
-  const json = await r.json();
-  if (!r.ok) throw new Error(json.error ?? r.statusText);
-  return json;
+// The simulation runs in a worker; each request is one of what used to be the Flask server's endpoints.
+const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
+const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+let nextId = 1;
+worker.onmessage = (e: MessageEvent<FromWorker>) => {
+  const msg = e.data;
+  if (msg.type === "snapshot") return applySnapshot(msg.snapshot);
+  const waiter = pending.get(msg.id)!;
+  pending.delete(msg.id);
+  if (msg.error) waiter.reject(new Error(msg.error));
+  else waiter.resolve(msg.result);
+};
+worker.onerror = (e) => toast("error", "The simulation stopped", e.message);
+
+function call<T = { ok: true }>(command: Command): Promise<T> {
+  const id = nextId++;
+  return new Promise<T>((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    worker.postMessage({ id, ...command });
+  });
 }
+type RoadChange = { changed: number; affected: number };
 
-const [network, flood, district, towns, initial] = await Promise.all(
-  ["/network", "/flood", "/district", "/towns", "/state"].map((p) => fetch(p).then((r) => r.json())),
-);
+const workerReady = new Promise((resolve, reject) => pending.set(0, { resolve, reject }));
+const getJson = <T>(path: string): Promise<T> => fetch(path).then((r) => r.json());
+const [network, flood, district, towns] = await Promise.all([
+  getJson<NetworkJson>("/data/network.json"),
+  getJson<FeatureCollection>("/data/flood.geojson"),
+  getJson<FeatureCollection>("/data/district.geojson"),
+  getJson<FeatureCollection>("/data/towns.geojson"),
+]);
+await workerReady;
+const initial = await call<State>({ cmd: "state" });
 
-const roads = network.paths.map((path, i) => ({
+const roads: Road[] = network.paths.map((path, i) => ({
   i, path, cls: network.classes[i], name: network.names[i], flags: network.flags[i],
   storage: network.storage[i], town: network.town[i],
 }));
 const townNames = network.towns;
 // "Manville borough" reads as "Manville", except where a borough and a township share a name (Hopewell).
-const baseName = (n) => n.replace(/ (township|borough|city)$/, "");
-const baseCounts = townNames.reduce((m, n) => m.set(baseName(n), (m.get(baseName(n)) ?? 0) + 1), new Map());
-const shortTown = (k) => (baseCounts.get(baseName(townNames[k])) > 1 ? townNames[k] : baseName(townNames[k]));
+const baseName = (n: string) => n.replace(/ (township|borough|city)$/, "");
+const baseCounts = townNames.reduce((m, n) => m.set(baseName(n), (m.get(baseName(n)) ?? 0) + 1), new Map<string, number>());
+const shortTown = (k: number) => (baseCounts.get(baseName(townNames[k]))! > 1 ? townNames[k] : baseName(townNames[k]));
 const floodedBridges = roads.filter((r) => (r.flags & FLAG_BRIDGE) && (r.flags & FLAG_FLOODED)).map((r) => r.i);
-const roadLabel = (r) => r.name || `Unnamed ${r.cls.replace("_", " ")}`;
+const roadLabel = (r: Road) => r.name || `Unnamed ${r.cls.replace("_", " ")}`;
 
-// Live state from the SSE stream (10 Hz) and the heavier /stats endpoint (polled at 1 Hz while running).
+// Live state from worker snapshots (10 Hz while running) and the heavier stats request (1 Hz while running).
 const load = new Float32Array(roads.length);
 const queued = new Int32Array(roads.length);
 const delayMin = new Float32Array(roads.length);
 const flow = new Float32Array(roads.length);
-let busy = [];
-let delayed = [];
-let routed = [];
+let busy: number[] = [];
+let delayed: number[] = [];
+let routed: number[] = [];
 let maxDelay = 1, maxFlow = 1;
 let closed = new Set(initial.closed);
-let snap = initial;
-let stats = null;
-let mode = "queues";
-let activeTab = "overview";
-let hovered = null;
-let selectedSeg = null;
-let selectedTown = null;
-let flash = { segs: [], on: false };
+let snap: Snapshot = initial;
+let stats: Stats | null = null;
+let mode: Mode = "queues";
+let activeTab: Tab = "overview";
+let hovered: PickingInfo | null = null;
+let selectedSeg: number | null = null;
+let selectedTown: number | null = null;
+let flash: { segs: number[]; on: boolean } = { segs: [], on: false };
 let version = 0;
 
 const tooltip = $("tooltip");
-const spark = clickSpark($("sparks"));
+const spark = clickSpark($<HTMLCanvasElement>("sparks"));
 
-function rampColor(x) {
+function rampColor(x: number): Rgb {
   const t = Math.min(1, Math.max(0, x)) * (RAMP.length - 1);
   const i = Math.min(RAMP.length - 2, Math.floor(t));
   const f = t - i;
-  return RAMP[i].map((c, k) => Math.round(c + (RAMP[i + 1][k] - c) * f));
+  return RAMP[i].map((c, k) => Math.round(c + (RAMP[i + 1][k] - c) * f)) as Rgb;
 }
 
 // Delay and route counts span several orders of magnitude; a log scale keeps the small ones visible.
-const logShare = (v, max) => Math.log1p(v) / Math.log1p(max);
+const logShare = (v: number, max: number) => Math.log1p(v) / Math.log1p(max);
 
 function heatLayer() {
-  const [data, value] = {
-    queues: [busy, (i) => load[i]],
-    delay: [delayed, (i) => logShare(delayMin[i], maxDelay)],
-    routes: [routed, (i) => logShare(flow[i], maxFlow)],
-  }[mode];
-  return new PathLayer({
+  const [data, value] = ({
+    queues: [busy, (i: number) => load[i]],
+    delay: [delayed, (i: number) => logShare(delayMin[i], maxDelay)],
+    routes: [routed, (i: number) => logShare(flow[i], maxFlow)],
+  } as const)[mode];
+  return new PathLayer<number>({
     id: `heat-${mode}`, data, widthUnits: "pixels", capRounded: true, jointRounded: true,
     getPath: (i) => roads[i].path,
     getColor: (i) => rampColor(value(i)),
@@ -89,12 +128,12 @@ function heatLayer() {
   });
 }
 
-function tiles(id, url, bitmapProps) {
+function tiles(id: string, url: string, bitmapProps: { tintColor?: Rgb; opacity?: number }) {
   return new TileLayer({
     id, data: url, minZoom: 0, maxZoom: 16, tileSize: 256,
     renderSubLayers: (props) => {
-      const { west, south, east, north } = props.tile.bbox;
-      return new BitmapLayer(props, { data: null, image: props.data, bounds: [west, south, east, north], ...bitmapProps });
+      const { west, south, east, north } = props.tile.bbox as GeoBoundingBox;
+      return new BitmapLayer(props, { data: undefined, image: props.data, bounds: [west, south, east, north], ...bitmapProps });
     },
   });
 }
@@ -110,17 +149,19 @@ function layers() {
     }),
     new GeoJsonLayer({
       id: "towns", data: towns, filled: true, stroked: true,
-      getFillColor: (f, { index }) => (index === selectedTown ? [255, 255, 255, 12] : [0, 0, 0, 0]),
-      getLineColor: (f, { index }) => (index === selectedTown ? [255, 255, 255, 200] : [255, 255, 255, activeTab === "towns" ? 50 : 0]),
-      getLineWidth: (f, { index }) => (index === selectedTown ? 2 : 1), lineWidthUnits: "pixels",
+      getFillColor: (_f, { index }) => (index === selectedTown ? [255, 255, 255, 12] : [0, 0, 0, 0]),
+      getLineColor: (_f, { index }) => (index === selectedTown ? [255, 255, 255, 200] : [255, 255, 255, activeTab === "towns" ? 50 : 0]),
+      getLineWidth: (_f, { index }) => (index === selectedTown ? 2 : 1), lineWidthUnits: "pixels",
       updateTriggers: { getFillColor: selectedTown, getLineColor: [selectedTown, activeTab], getLineWidth: selectedTown },
     }),
     new GeoJsonLayer({
       id: "district", data: district, filled: false, stroked: true,
       getLineColor: [255, 255, 255, 110], lineWidthMinPixels: 1,
-      getDashArray: [4, 4], dashJustified: true, extensions: [new PathStyleExtension({ dash: true })],
+      // PathStyleExtension's dash props aren't part of GeoJsonLayer's declared props.
+      ...({ getDashArray: [4, 4], dashJustified: true } as object),
+      extensions: [new PathStyleExtension({ dash: true })],
     }),
-    new PathLayer({
+    new PathLayer<Road>({
       id: "roads", data: roads, pickable: true, autoHighlight: true, highlightColor: [255, 255, 255, 90],
       widthUnits: "pixels", capRounded: true, jointRounded: true,
       getPath: (r) => r.path,
@@ -128,21 +169,22 @@ function layers() {
       getWidth: (r) => (ROAD_STYLE[r.cls] ?? LOCAL_STYLE)[1],
     }),
     heatLayer(),
-    new PathLayer({
+    new PathLayer<number>({
       id: "closed", data: [...closed], widthUnits: "pixels",
       getPath: (i) => roads[i].path,
       // Fresh closures land white and wide, then ease down to the dashed red closure style.
       getColor: (i) => (flashSet.has(i) ? [255, 255, 255] : CRITICAL),
       getWidth: (i) => (flashSet.has(i) ? 10 : 3),
-      getDashArray: [3, 2], dashJustified: true, extensions: [new PathStyleExtension({ dash: true })],
-      transitions: { getWidth: { duration: 700, easing: (t) => 1 - (1 - t) ** 3 }, getColor: 700 },
+      ...({ getDashArray: [3, 2], dashJustified: true } as object),
+      extensions: [new PathStyleExtension({ dash: true })],
+      transitions: { getWidth: { duration: 700, easing: (t: number) => 1 - (1 - t) ** 3 }, getColor: 700 },
       updateTriggers: { getColor: [flash.on, flash.segs], getWidth: [flash.on, flash.segs] },
     }),
-    new PathLayer({
+    new PathLayer<number>({
       id: "selected", data: selectedSeg == null ? [] : [selectedSeg], widthUnits: "pixels",
       getPath: (i) => roads[i].path, getColor: [255, 255, 255], getWidth: 6, capRounded: true, jointRounded: true,
     }),
-    new ScatterplotLayer({
+    new ScatterplotLayer<number[]>({
       id: "stranded", data: stats?.stranded ?? [], radiusUnits: "pixels", stroked: true, pickable: true,
       getPosition: (p) => [p[0], p[1]], getRadius: (p) => 4 + Math.min(10, Math.sqrt(p[2])),
       getFillColor: CRITICAL, getLineColor: [255, 255, 255], lineWidthMinPixels: 1.5,
@@ -155,7 +197,7 @@ function layers() {
 const panelWidth = () => (innerWidth > 760 ? 400 : 0);
 const [minx, miny, maxx, maxy] = network.bounds;
 
-function fit(bounds, extra = {}) {
+function fit(bounds: [[number, number], [number, number]], extra: { maxZoom?: number } = {}) {
   // fitBounds asserts if padding exceeds the viewport, which happens in a small window.
   const w = Math.max(innerWidth, 100), h = Math.max(innerHeight, 100);
   const padRight = Math.min(40 + panelWidth(), w * 0.45);
@@ -170,27 +212,29 @@ function fit(bounds, extra = {}) {
 }
 
 const start = fit([[minx, miny], [maxx, maxy]]);
-let viewState = { longitude: start.longitude, latitude: start.latitude, zoom: start.zoom, pitch: 0, bearing: 0 };
+let viewState: MapViewState = {
+  longitude: start.longitude, latitude: start.latitude, zoom: start.zoom, pitch: 0, bearing: 0,
+};
 
 const map = new Deck({
-  parent: $("map"),
+  parent: $<HTMLDivElement>("map"),
   viewState,
   controller: { dragRotate: false, touchRotate: false },
-  onViewStateChange: ({ viewState: next }) => { viewState = next; map.setProps({ viewState }); },
+  onViewStateChange: ({ viewState: next }) => { viewState = next as MapViewState; map.setProps({ viewState }); },
   layers: layers(),
   getCursor: ({ isDragging, isHovering }) => (isDragging ? "grabbing" : isHovering ? "pointer" : "grab"),
   onHover: (info) => { hovered = info.object ? info : null; renderTooltip(); },
-  onClick: toggleRoad,
+  onClick: (info) => { toggleRoad(info); },
 });
 const redraw = () => map.setProps({ layers: layers() });
 
-function flyTo(target) {
+function flyTo(target: { longitude: number; latitude: number; zoom: number }) {
   viewState = { ...viewState, ...target, transitionDuration: 900, transitionInterpolator: new FlyToInterpolator() };
   map.setProps({ viewState });
 }
 
 // Center a point in the part of the map not covered by the panels, not the middle of the window.
-function centerOn(longitude, latitude, zoom) {
+function centerOn(longitude: number, latitude: number, zoom: number) {
   const w = innerWidth, h = innerHeight;
   const wide = w > 760;
   const cx = wide ? (Math.min(330, w * 0.3) + (w - panelWidth())) / 2 : w / 2;
@@ -208,13 +252,13 @@ function renderTooltip() {
     return;
   }
   const { object, x, y, layer } = hovered;
-  if (layer.id === "stranded") {
-    const [, , count, town] = object;
+  if (layer?.id === "stranded") {
+    const [, , count, town] = object as number[];
     tooltip.innerHTML = `<h3>${fmt(count)} stranded car${count === 1 ? "" : "s"}</h3>
       <div class="where">${escapeHtml(townNames[town])}</div>
       <div>Every route from here to dry ground crosses a closed road.</div>`;
   } else {
-    const r = object;
+    const r = object as Road;
     const isClosed = closed.has(r.i);
     const tags = `<span class="tag">${r.cls.replace("_", " ")}</span>`
       + (r.flags & FLAG_BRIDGE ? '<span class="tag">bridge</span>' : "")
@@ -239,8 +283,9 @@ function renderTooltip() {
   tooltip.classList.add("show");
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+function escapeHtml(s: unknown) {
+  const entities: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  return String(s).replace(/[&<>"']/g, (c) => entities[c]);
 }
 
 // Toasts
@@ -251,7 +296,7 @@ const ICONS = {
   error: '<svg viewBox="0 0 16 16" fill="#d03b3b"><path d="M8 1.5 15 14H1L8 1.5zm-.75 4.5v4h1.5V6h-1.5zm0 5v1.5h1.5V11h-1.5z"/></svg>',
 };
 
-function toast(kind, title, detail = "") {
+function toast(kind: keyof typeof ICONS, title: string, detail = "") {
   const el = document.createElement("div");
   el.className = "toast";
   el.innerHTML = `${ICONS[kind]}<span>${escapeHtml(title)}</span>${detail ? `<span class="t-detail">${escapeHtml(detail)}</span>` : ""}`;
@@ -259,37 +304,39 @@ function toast(kind, title, detail = "") {
   setTimeout(() => { el.classList.add("out"); el.addEventListener("animationend", () => el.remove()); }, 3600);
 }
 
-function flashSegments(segs) {
+function flashSegments(segs: number[]) {
   flash = { segs, on: true };
   redraw();
   // Render one frame wide and white, then let the layer's transition ease it to the closed style.
   requestAnimationFrame(() => requestAnimationFrame(() => { flash = { segs, on: false }; redraw(); }));
 }
 
-const rerouted = (n) => (n ? `${fmt(n)} driver${n === 1 ? "" : "s"} rerouted` : "no current routes used it");
+const rerouted = (n: number) => (n ? `${fmt(n)} driver${n === 1 ? "" : "s"} rerouted` : "no current routes used it");
 
-async function toggleRoad({ object, x, y, layer }) {
-  if (!object || layer.id !== "roads") return;
-  const closing = !closed.has(object.i);
+async function toggleRoad({ object, x, y, layer }: PickingInfo) {
+  if (!object || layer?.id !== "roads") return;
+  const road = object as Road;
+  const closing = !closed.has(road.i);
   spark(x, y, closing ? "#d03b3b" : "#ededed");
-  closing ? closed.add(object.i) : closed.delete(object.i);
-  if (closing) flashSegments([object.i]);
+  if (closing) closed.add(road.i);
+  else closed.delete(road.i);
+  if (closing) flashSegments([road.i]);
   else redraw();
   renderTooltip();
   renderBridgeButton();
   try {
-    const result = await post(closing ? "/close" : "/open", { seg: object.i });
-    toast(closing ? "closed" : "open", `${closing ? "Closed" : "Reopened"} ${roadLabel(object)}`,
+    const result = await call<RoadChange>({ cmd: closing ? "close" : "open", segs: [road.i] });
+    toast(closing ? "closed" : "open", `${closing ? "Closed" : "Reopened"} ${roadLabel(road)}`,
       closing ? rerouted(result.affected) : "");
     refreshStats();
   } catch (err) {
-    toast("error", "Couldn't update the road", err.message);
+    toast("error", "Couldn't update the road", (err as Error).message);
   }
 }
 
 // Flooded-bridges toggle
 
-const bridgeBtn = $("close-bridges");
+const bridgeBtn = $<HTMLButtonElement>("close-bridges");
 let bridgeBusy = false;
 
 function renderBridgeButton() {
@@ -310,7 +357,7 @@ bridgeBtn.onclick = async () => {
   try {
     // A floor on the busy state so the spinner reads as a deliberate step rather than a flicker.
     const [result] = await Promise.all([
-      post(closing ? "/close" : "/open", { segs: floodedBridges }),
+      call<RoadChange>({ cmd: closing ? "close" : "open", segs: floodedBridges }),
       new Promise((r) => setTimeout(r, 450)),
     ]);
     floodedBridges.forEach((i) => (closing ? closed.add(i) : closed.delete(i)));
@@ -327,37 +374,37 @@ bridgeBtn.onclick = async () => {
   } catch (err) {
     bridgeBusy = false;
     renderBridgeButton();
-    toast("error", "Couldn't change the bridges", err.message);
+    toast("error", "Couldn't change the bridges", (err as Error).message);
   }
 };
 
 $("open-all").onclick = async () => {
   const n = closed.size;
   if (!n) return;
-  await post("/open-all");
+  await call({ cmd: "openAll" });
   toast("open", `Reopened ${fmt(n)} road${n === 1 ? "" : "s"}`);
   refreshStats();
 };
 
 // Clock, counters, chart
 
-const counters = Object.fromEntries(
-  ["evacuated", "on_road", "waiting", "stranded"].map((k) => [k, countUp($(`n-${k}`))]),
-);
-const toPoints = (history, total) => history.map(([t, n]) => ({ t, pct: (100 * n) / total }));
-const runs = {
+const COUNTER_KEYS = ["evacuated", "on_road", "waiting", "stranded"] as const;
+const counters = Object.fromEntries(COUNTER_KEYS.map((k) => [k, countUp($(`n-${k}`))])) as
+  Record<(typeof COUNTER_KEYS)[number], ReturnType<typeof countUp>>;
+const toPoints = (history: [number, number][], total: number): Point[] => history.map(([t, n]) => ({ t, pct: (100 * n) / total }));
+const runs: { current: { id: number; points: Point[] }; previous: { points: Point[] } | null } = {
   current: { id: initial.run, points: toPoints(initial.history, initial.total) },
   previous: initial.previous && {
     points: toPoints(initial.previous.points, initial.previous.total),
   },
 };
 
-function fmtClock(t) {
+function fmtClock(t: number) {
   const s = Math.floor(t);
   return [s / 3600, (s % 3600) / 60, s % 60].map((v) => String(Math.floor(v)).padStart(2, "0")).join(":");
 }
 
-function applySnapshot(s) {
+function applySnapshot(s: Snapshot) {
   const newRun = s.run !== runs.current.id;
   if (newRun) {
     if (runs.current.points.length > 2) runs.previous = runs.current;
@@ -376,7 +423,7 @@ function applySnapshot(s) {
   version++;
   snap = s;
 
-  for (const [k, c] of Object.entries(counters)) c.set(s.counts[k]);
+  for (const k of COUNTER_KEYS) counters[k].set(s.counts[k]);
   $("stranded-tile").dataset.alert = String(s.counts.stranded > 0);
   $("clock").textContent = fmtClock(s.t);
   $("pct").textContent = `${Math.floor(pct)}% out`;
@@ -403,7 +450,7 @@ function applySnapshot(s) {
 function renderResult() {
   const el = $("result");
   const sum = stats?.summary;
-  if (!snap.done || !sum || stats.run !== snap.run) {
+  if (!snap.done || !sum || stats!.run !== snap.run) {
     el.classList.remove("show");
     return;
   }
@@ -415,20 +462,20 @@ function renderResult() {
   el.classList.add("show");
 }
 
-const chart = $("chart");
+const chart = document.getElementById("chart") as unknown as SVGSVGElement;
 const chartTip = $("chart-tip");
 const M = { top: 8, right: 34, bottom: 18, left: 30 };
-let chartHover = null;
+let chartHover: number | null = null;
 
-function renderChart(hoverX = null) {
+function renderChart(hoverX: number | null = null) {
   const w = chart.clientWidth, h = chart.clientHeight;
   if (!w) return;
   const iw = w - M.left - M.right, ih = h - M.top - M.bottom;
-  const all = [runs.current, runs.previous].filter(Boolean);
+  const all = [runs.current, runs.previous].filter((r) => r !== null);
   const tMax = Math.max(3600, ...all.flatMap((r) => r.points.map((p) => p.t))) * 1.02;
-  const xs = (t) => M.left + (t / tMax) * iw;
-  const ys = (p) => M.top + ih - (p / 100) * ih;
-  const line = (pts) => pts.map((p, i) => `${i ? "L" : "M"}${xs(p.t).toFixed(1)},${ys(p.pct).toFixed(1)}`).join("");
+  const xs = (t: number) => M.left + (t / tMax) * iw;
+  const ys = (p: number) => M.top + ih - (p / 100) * ih;
+  const line = (pts: Point[]) => pts.map((p, i) => `${i ? "L" : "M"}${xs(p.t).toFixed(1)},${ys(p.pct).toFixed(1)}`).join("");
 
   const step = tMax > 4 * 3600 ? 3600 : tMax > 2 * 3600 ? 1800 : 900;
   let svg = `<defs><linearGradient id="fade" x1="0" x2="0" y1="0" y2="1">
@@ -453,7 +500,7 @@ function renderChart(hoverX = null) {
 
   if (hoverX != null && cur.length) {
     const t = Math.max(0, Math.min(tMax, ((hoverX - M.left) / iw) * tMax));
-    const at = (pts) => pts.reduce((best, p) => (Math.abs(p.t - t) < Math.abs(best.t - t) ? p : best), pts[0]);
+    const at = (pts: Point[]) => pts.reduce((best, p) => (Math.abs(p.t - t) < Math.abs(best.t - t) ? p : best), pts[0]);
     const c = at(cur);
     svg += `<line class="cross" x1="${xs(c.t)}" x2="${xs(c.t)}" y1="${M.top}" y2="${M.top + ih}"/>`;
     svg += `<circle class="marker" r="4" cx="${xs(c.t)}" cy="${ys(c.pct)}"/>`;
@@ -466,9 +513,9 @@ function renderChart(hoverX = null) {
     chartTip.innerHTML = tip;
     chartTip.style.left = `${Math.min(xs(c.t) + 10, w - chartTip.offsetWidth)}px`;
     chartTip.style.top = `${M.top}px`;
-    chartTip.style.opacity = 1;
+    chartTip.style.opacity = "1";
   } else {
-    chartTip.style.opacity = 0;
+    chartTip.style.opacity = "0";
   }
   chart.innerHTML = svg;
 }
@@ -482,25 +529,27 @@ let statsInFlight = false;
 async function refreshStats() {
   if (statsInFlight) return;
   statsInFlight = true;
+  let next: Stats;
   try {
-    stats = await fetch("/stats").then((r) => r.json());
+    next = await call<Stats>({ cmd: "stats" });
   } finally {
     statsInFlight = false;
   }
+  stats = next;
   delayMin.fill(0);
   flow.fill(0);
-  stats.delay.segs.forEach((seg, k) => { delayMin[seg] = stats.delay.veh_min[k]; });
-  stats.flow.segs.forEach((seg, k) => { flow[seg] = stats.flow.cars[k]; });
-  delayed = stats.delay.segs;
-  routed = stats.flow.segs;
-  maxDelay = stats.delay.veh_min.reduce((a, b) => Math.max(a, b), 1);
-  maxFlow = stats.flow.cars.reduce((a, b) => Math.max(a, b), 1);
+  next.delay.segs.forEach((seg, k) => { delayMin[seg] = next.delay.veh_min[k]; });
+  next.flow.segs.forEach((seg, k) => { flow[seg] = next.flow.cars[k]; });
+  delayed = next.delay.segs;
+  routed = next.flow.segs;
+  maxDelay = next.delay.veh_min.reduce((a, b) => Math.max(a, b), 1);
+  maxFlow = next.flow.cars.reduce((a, b) => Math.max(a, b), 1);
   version++;
 
-  renderDemand(stats.demand);
-  if (stats.demand.warning !== warning) { warning = stats.demand.warning; renderWarning(); }
-  const sum = stats.summary;
-  const tile = (v, unit) => (v == null ? "—" : `${unit === "veh-h" ? fmt(v) : minutes(v)}<small>${unit}</small>`);
+  renderDemand(next.demand);
+  if (next.demand.warning !== warning) { warning = next.demand.warning; renderWarning(); }
+  const sum = next.summary;
+  const tile = (v: number | null, unit: string) => (v == null ? "—" : `${unit === "veh-h" ? fmt(v) : minutes(v)}<small>${unit}</small>`);
   $("m-t90").innerHTML = tile(sum.t90_min, "min");
   $("m-last").innerHTML = tile(sum.cleared_min, "min");
   $("m-stranded").innerHTML = sum.stranded_all > sum.stranded
@@ -508,7 +557,7 @@ async function refreshStats() {
   $("m-median").innerHTML = tile(sum.median_min, "min");
   $("m-delay").innerHTML = tile(sum.mean_delay_min, "min");
   $("m-vh").innerHTML = tile(sum.delay_veh_h, "veh-h");
-  $("compare-badge").hidden = !stats.previous;
+  $("compare-badge").hidden = !next.previous;
 
   renderLegend();
   renderResult();
@@ -519,7 +568,7 @@ async function refreshStats() {
 }
 setInterval(() => { if (snap.running) refreshStats(); }, 1000);
 
-function renderDemand(d) {
+function renderDemand(d: State["demand"]) {
   $("d-people").textContent = fmt(d.people);
   $("d-households").textContent = fmt(d.households);
   $("d-cars").innerHTML = d.shadow_cars ? `${fmt(d.cars)}<small>+${fmt(d.shadow_cars)} nbrs</small>` : fmt(d.cars);
@@ -553,17 +602,17 @@ function renderBottlenecks() {
       <div class="row-val"><b>${b.delay_veh_h.toFixed(1)} veh-h</b><span>${fmt(b.queued)} queued · ${fmt(b.flow)} routed</span></div>
     </div>`;
   }).join("");
-  for (const row of list.querySelectorAll(".list-row")) {
+  for (const row of list.querySelectorAll<HTMLElement>(".list-row")) {
     const go = () => focusSegment(Number(row.dataset.seg));
     row.onclick = go;
     row.onkeydown = (e) => { if (e.key === "Enter") go(); };
   }
 }
 
-function focusSegment(seg) {
+function focusSegment(seg: number) {
   selectedSeg = selectedSeg === seg ? null : seg;
   if (selectedSeg != null) {
-    const b = stats.bottlenecks.find((x) => x.seg === seg);
+    const b = stats!.bottlenecks.find((x) => x.seg === seg)!;
     centerOn(b.at[0], b.at[1], 15.5);
     if (mode !== "delay") setMode("delay");
   }
@@ -571,12 +620,13 @@ function focusSegment(seg) {
   redraw();
 }
 
-let townSort = "risk";
+type TownSort = "risk" | "name" | "cars" | "pct" | "cleared" | "stranded" | "novehicle";
+let townSort: TownSort = "risk";
 function renderTowns() {
-  const body = $("towns").querySelector("tbody");
+  const body = $("towns").querySelector("tbody")!;
   const rows = [...(stats?.towns ?? [])];
-  const share = (t) => (t.cars ? t.evacuated / t.cars : 1);
-  const sorters = {
+  const share = (t: TownRow) => (t.cars ? t.evacuated / t.cars : 1);
+  const sorters: Record<TownSort, (a: TownRow, b: TownRow) => number> = {
     risk: (a, b) => b.stranded - a.stranded || b.remaining - a.remaining || (b.cleared_min ?? 0) - (a.cleared_min ?? 0)
       || b.no_vehicle - a.no_vehicle,
     name: (a, b) => townNames[a.town].localeCompare(townNames[b.town]),
@@ -587,7 +637,7 @@ function renderTowns() {
     novehicle: (a, b) => b.no_vehicle - a.no_vehicle,
   };
   rows.sort(sorters[townSort]);
-  for (const btn of $("towns").querySelectorAll("th button")) btn.setAttribute("aria-pressed", String(btn.dataset.sort === townSort));
+  for (const btn of $("towns").querySelectorAll<HTMLElement>("th button")) btn.setAttribute("aria-pressed", String(btn.dataset.sort === townSort));
   body.innerHTML = rows.map((t, k) => {
     const p = Math.floor(100 * share(t));
     return `<tr tabindex="0" data-town="${t.town}" style="animation-delay:${k * 18}ms" aria-current="${t.town === selectedTown}"
@@ -600,27 +650,28 @@ function renderTowns() {
       <td class="r num ${t.no_vehicle ? "" : "dim"}" title="${fmt(t.no_vehicle_people)} people">${fmt(t.no_vehicle)}</td>
     </tr>`;
   }).join("");
-  for (const tr of body.querySelectorAll("tr")) {
+  for (const tr of body.querySelectorAll<HTMLElement>("tr")) {
     const go = () => focusTown(Number(tr.dataset.town));
     tr.onclick = go;
     tr.onkeydown = (e) => { if (e.key === "Enter") go(); };
   }
 }
 
-for (const btn of $("towns").querySelectorAll("th button")) {
-  btn.onclick = () => { townSort = townSort === btn.dataset.sort ? "risk" : btn.dataset.sort; renderTowns(); };
+for (const btn of $("towns").querySelectorAll<HTMLElement>("th button")) {
+  btn.onclick = () => { townSort = townSort === btn.dataset.sort ? "risk" : btn.dataset.sort as TownSort; renderTowns(); };
 }
 
-function focusTown(k) {
+function focusTown(k: number) {
   selectedTown = selectedTown === k ? null : k;
-  const feature = towns.features[k];
+  const feature: Feature | undefined = towns.features[k];
   if (selectedTown != null && feature) {
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    const walk = (c) => {
-      if (typeof c[0] !== "number") return c.forEach(walk);
-      x0 = Math.min(x0, c[0]); y0 = Math.min(y0, c[1]); x1 = Math.max(x1, c[0]); y1 = Math.max(y1, c[1]);
+    const walk = (c: unknown[]): void => {
+      if (typeof c[0] !== "number") return c.forEach((inner) => walk(inner as unknown[]));
+      const [x, y] = c as Position;
+      x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y);
     };
-    walk(feature.geometry.coordinates);
+    walk((feature.geometry as { coordinates: unknown[] }).coordinates);
     const v = fit([[x0, y0], [x1, y1]], { maxZoom: 15 });
     flyTo({ longitude: v.longitude, latitude: v.latitude, zoom: v.zoom });
   }
@@ -629,7 +680,8 @@ function focusTown(k) {
 }
 
 // [label, summary key, unit, which direction is better: -1 lower, 0 neutral]
-const COMPARE_ROWS = [
+type NumericKey = { [K in keyof Summary]: Summary[K] extends number | null ? K : never }[keyof Summary];
+const COMPARE_ROWS: [string, NumericKey, string, number][] = [
   ["50% out by", "t50_min", "min", -1],
   ["90% out by", "t90_min", "min", -1],
   ["Last one out", "cleared_min", "min", -1],
@@ -645,7 +697,7 @@ const COMPARE_ROWS = [
   ["Flood-zone cars", "cars", "", 0],
   ["Neighbor cars", "shadow_cars", "", 0],
 ];
-const WARNING_LABEL = { sudden: "Sudden", short: "Hours", long: "A day" };
+const WARNING_LABEL: Record<string, string> = { sudden: "Sudden", short: "Hours", long: "A day" };
 const ARROW_UP = '<svg viewBox="0 0 10 10" fill="currentColor"><path d="M5 1 9.5 8h-9z"/></svg>';
 const ARROW_DOWN = '<svg viewBox="0 0 10 10" fill="currentColor"><path d="M5 9 .5 2h9z"/></svg>';
 
@@ -653,8 +705,8 @@ function renderCompare() {
   const cur = stats?.summary, prev = stats?.previous;
   $("compare-empty").hidden = !!prev;
   $("compare").hidden = !prev;
-  if (!prev) return;
-  const show = (v, unit) => (v == null ? '<span class="dim">—</span>' : unit === "min" ? minutes(v) : fmt(v));
+  if (!cur || !prev) return;
+  const show = (v: number | null, unit: string) => (v == null ? '<span class="dim">—</span>' : unit === "min" ? minutes(v) : fmt(v));
   const rows = COMPARE_ROWS.map(([label, key, unit, better]) => {
     const a = cur[key], b = prev[key];
     let change = '<span class="dim">—</span>';
@@ -671,15 +723,15 @@ function renderCompare() {
     return `<tr><td>${label}${unit ? ` <span class="dim">${unit}</span>` : ""}</td>
       <td class="r num">${show(a, unit)}</td><td class="r num">${show(b, unit)}</td><td class="r">${change}</td></tr>`;
   });
-  const road = (v) => `<td class="r text" title="${escapeHtml(v ?? "")}">${escapeHtml(v ?? "—")}</td>`;
+  const road = (v: string | null) => `<td class="r text" title="${escapeHtml(v ?? "")}">${escapeHtml(v ?? "—")}</td>`;
   rows.push(`<tr><td>Warning time</td><td class="r">${WARNING_LABEL[cur.warning]}</td><td class="r">${WARNING_LABEL[prev.warning] ?? "—"}</td><td></td></tr>`);
   rows.push(`<tr><td>Worst bottleneck</td>${road(cur.worst_road)}${road(prev.worst_road)}<td></td></tr>`);
-  $("compare").querySelector("tbody").innerHTML = rows.join("");
+  $("compare").querySelector("tbody")!.innerHTML = rows.join("");
 }
 
 // Map layer switch and legend
 
-const LEGENDS = {
+const LEGENDS: Record<Mode, [string, () => string, () => string]> = {
   queues: ["Road load, queue ÷ capacity", () => "Light", () => "Jammed"],
   delay: ["Delay caused, vehicle-minutes (log)", () => "1", () => fmt(maxDelay)],
   routes: ["Cars routed through, current plan (log)", () => "1", () => fmt(maxFlow)],
@@ -692,33 +744,34 @@ function renderLegend() {
   $("legend-hi").textContent = hi();
 }
 
-function placeThumb(seg, active) {
-  const thumb = seg.querySelector(".thumb");
+function placeThumb(seg: HTMLElement, active: HTMLElement | undefined) {
+  if (!active) return;
+  const thumb = seg.querySelector<HTMLElement>(".thumb")!;
   thumb.style.width = `${active.offsetWidth}px`;
   thumb.style.transform = `translateX(${active.offsetLeft}px)`;
 }
 
-function setMode(next) {
+function setMode(next: Mode) {
   mode = next;
-  const buttons = [...$("modes").querySelectorAll("button")];
+  const buttons = [...$("modes").querySelectorAll<HTMLElement>("button")];
   buttons.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === mode)));
   placeThumb($("modes"), buttons.find((b) => b.dataset.mode === mode));
   renderLegend();
   redraw();
 }
-for (const b of $("modes").querySelectorAll("button")) b.onclick = () => setMode(b.dataset.mode);
+for (const b of $("modes").querySelectorAll<HTMLElement>("button")) b.onclick = () => setMode(b.dataset.mode as Mode);
 
 // Tabs
 
-function setTab(name) {
+function setTab(name: Tab) {
   activeTab = name;
-  const buttons = [...$("tabbar").querySelectorAll("button")];
+  const buttons = [...$("tabbar").querySelectorAll<HTMLElement>("button")];
   buttons.forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === name)));
-  const btn = buttons.find((b) => b.dataset.tab === name);
-  const line = $("tabbar").querySelector(".underline");
+  const btn = buttons.find((b) => b.dataset.tab === name)!;
+  const line = $("tabbar").querySelector<HTMLElement>(".underline")!;
   line.style.width = `${btn.offsetWidth - 20}px`;
   line.style.transform = `translateX(${btn.offsetLeft + 10}px)`;
-  for (const p of document.querySelectorAll(".tab-panel")) p.hidden = p.dataset.panel !== name;
+  for (const p of document.querySelectorAll<HTMLElement>(".tab-panel")) p.hidden = p.dataset.panel !== name;
   if (name !== "towns") selectedTown = null;
   if (name !== "bottlenecks") selectedSeg = null;
   if (name === "overview") renderChart();
@@ -727,7 +780,7 @@ function setTab(name) {
   if (name === "compare") renderCompare();
   redraw();
 }
-for (const b of $("tabbar").querySelectorAll("button")) b.onclick = () => setTab(b.dataset.tab);
+for (const b of $("tabbar").querySelectorAll<HTMLElement>("button")) b.onclick = () => setTab(b.dataset.tab as Tab);
 
 // Run controls
 
@@ -736,28 +789,28 @@ for (const steps of initial.speeds) {
   const b = document.createElement("button");
   b.textContent = `${Math.round((steps * 5) / 0.1)}×`;
   b.title = `${((steps * 5) / 0.1 / 60).toFixed(1)} sim-minutes per second`;
-  b.dataset.steps = steps;
-  b.onclick = () => post("/speed", { steps });
+  b.dataset.steps = String(steps);
+  b.onclick = () => call({ cmd: "speed", steps });
   speedSeg.append(b);
 }
-function renderSpeed(steps) {
-  const buttons = [...speedSeg.querySelectorAll("button")];
+function renderSpeed(steps: number) {
+  const buttons = [...speedSeg.querySelectorAll<HTMLElement>("button")];
   const active = buttons.find((b) => Number(b.dataset.steps) === steps);
   buttons.forEach((b) => b.setAttribute("aria-pressed", String(b === active)));
   placeThumb(speedSeg, active);
 }
 
-const rate = $("rate");
-const shadow = $("shadow");
-let warning = initial.demand.warning;
-const togglePlay = () => post(snap.running ? "/pause" : "/play");
-const resetRun = () => post("/reset", { rate: Number(rate.value), shadow: Number(shadow.value), warning });
+const rate = $<HTMLInputElement>("rate");
+const shadow = $<HTMLInputElement>("shadow");
+let warning: Warning = initial.demand.warning;
+const togglePlay = () => call({ cmd: snap.running ? "pause" : "play" });
+const resetRun = () => call({ cmd: "reset", rate: Number(rate.value), shadow: Number(shadow.value), warning });
 const changeScenario = async () => { await resetRun(); refreshStats(); };
 $("play").onclick = togglePlay;
 $("reset").onclick = resetRun;
 
-rate.value = initial.demand.rate;
-shadow.value = initial.demand.shadow;
+rate.value = String(initial.demand.rate);
+shadow.value = String(initial.demand.shadow);
 const showSliders = () => {
   $("rate-val").textContent = `${rate.value}%`;
   $("shadow-val").textContent = `${shadow.value}%`;
@@ -768,12 +821,12 @@ rate.onchange = shadow.onchange = changeScenario;
 
 const warningSeg = $("warning");
 function renderWarning() {
-  const buttons = [...warningSeg.querySelectorAll("button")];
+  const buttons = [...warningSeg.querySelectorAll<HTMLElement>("button")];
   buttons.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.warning === warning)));
   placeThumb(warningSeg, buttons.find((b) => b.dataset.warning === warning));
 }
-for (const b of warningSeg.querySelectorAll("button")) {
-  b.onclick = () => { warning = b.dataset.warning; renderWarning(); changeScenario(); };
+for (const b of warningSeg.querySelectorAll<HTMLElement>("button")) {
+  b.onclick = () => { warning = b.dataset.warning as Warning; renderWarning(); changeScenario(); };
 }
 
 addEventListener("keydown", (e) => {
@@ -784,19 +837,17 @@ addEventListener("keydown", (e) => {
 
 // On a phone the dock can't float beside the panel, so it joins the panel's scroll.
 const narrow = matchMedia("(max-width: 760px)");
-const placeDock = () => (narrow.matches ? document.querySelector(".tab-body") : document.body).append($("dock"));
+const placeDock = () => (narrow.matches ? document.querySelector(".tab-body")! : document.body).append($("dock"));
 narrow.addEventListener("change", placeDock);
 placeDock();
 
-for (const [k, c] of Object.entries(counters)) c.set(initial.counts[k], { instant: true });
+for (const k of COUNTER_KEYS) counters[k].set(initial.counts[k], { instant: true });
 applySnapshot(initial);
 renderWarning();
 setMode("queues");
 setTab("overview");
 renderDemand(initial.demand);
 await refreshStats();
-const events = new EventSource("/stream");
-events.onmessage = (e) => applySnapshot(JSON.parse(e.data));
 addEventListener("resize", () => { renderSpeed(snap.speed); renderWarning(); setMode(mode); setTab(activeTab); });
 
 $("loader").classList.add("gone");

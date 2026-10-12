@@ -4,13 +4,13 @@
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 // CountUp: the displayed number chases its target on a spring, so live counters glide instead of flicker.
-export function countUp(el, { duration = 0.8, format = (v) => Math.round(v).toLocaleString("en-US") } = {}) {
+export function countUp(el: HTMLElement, { duration = 0.8, format = (v: number) => Math.round(v).toLocaleString("en-US") } = {}) {
   const stiffness = 100 / duration;
   const damping = 20 + 40 / duration;
   let value = 0, velocity = 0, target = 0, raf = 0, last = 0;
   el.textContent = format(0);
 
-  const tick = (now) => {
+  const tick = (now: number) => {
     const dt = Math.min(0.064, (now - last) / 1000);
     last = now;
     // Semi-implicit Euler, substepped: the spring is stiff relative to a 16 ms frame.
@@ -30,7 +30,7 @@ export function countUp(el, { duration = 0.8, format = (v) => Math.round(v).toLo
   };
 
   return {
-    set(next, { instant = false } = {}) {
+    set(next: number, { instant = false } = {}) {
       target = next;
       if (instant || reduceMotion) {
         value = next;
@@ -47,9 +47,9 @@ export function countUp(el, { duration = 0.8, format = (v) => Math.round(v).toLo
 }
 
 // ClickSpark: short lines burst outward from a point and ease away.
-export function clickSpark(canvas, { color = "#ededed", count = 9, radius = 22, size = 9, duration = 420 } = {}) {
-  const ctx = canvas.getContext("2d");
-  const sparks = [];
+export function clickSpark(canvas: HTMLCanvasElement, { color = "#ededed", count = 9, radius = 22, size = 9, duration = 420 } = {}) {
+  const ctx = canvas.getContext("2d")!;
+  const sparks: { x: number; y: number; angle: number; start: number; color: string }[] = [];
   let raf = 0;
 
   const fit = () => {
@@ -61,7 +61,7 @@ export function clickSpark(canvas, { color = "#ededed", count = 9, radius = 22, 
   new ResizeObserver(fit).observe(canvas);
   fit();
 
-  const draw = (now) => {
+  const draw = (now: number) => {
     ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
     for (let i = sparks.length - 1; i >= 0; i--) {
       const s = sparks[i];
@@ -86,7 +86,7 @@ export function clickSpark(canvas, { color = "#ededed", count = 9, radius = 22, 
     raf = sparks.length ? requestAnimationFrame(draw) : 0;
   };
 
-  return (x, y, sparkColor = color) => {
+  return (x: number, y: number, sparkColor = color) => {
     if (reduceMotion) return;
     const start = performance.now();
     for (let i = 0; i < count; i++) {

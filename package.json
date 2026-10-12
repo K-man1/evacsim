@@ -1,0 +1,35 @@
+{
+  "name": "evacsim",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "node --test tests/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4"
+  },
+  "dependencies": {
+    "deck.gl": "9.1.14",
+    "@deck.gl/extensions": "9.1.14"
+  },
+  "overrides": {
+    "@deck.gl/core": "9.1.14",
+    "@deck.gl/layers": "9.1.14",
+    "@deck.gl/geo-layers": "9.1.14",
+    "@deck.gl/extensions": "9.1.14",
+    "@deck.gl/aggregation-layers": "9.1.14",
+    "@deck.gl/mesh-layers": "9.1.14",
+    "@deck.gl/google-maps": "9.1.14",
+    "@deck.gl/json": "9.1.14",
+    "@deck.gl/mapbox": "9.1.14",
+    "@deck.gl/react": "9.1.14",
+    "@deck.gl/carto": "9.1.14",
+    "@deck.gl/arcgis": "9.1.14",
+    "@deck.gl/widgets": "9.1.14"
+  }
+}

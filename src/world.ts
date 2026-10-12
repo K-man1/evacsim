@@ -11,7 +11,7 @@ export interface NetworkJson {
   n_nodes: number;
   n_edges: number;
   n_segs: number;
-  paths: number[][][];
+  paths: [number, number][][];
   classes: string[];
   names: string[];
   flags: number[];
@@ -160,6 +160,11 @@ export class World {
       queued: segs.map((g) => queued.get(g)!),
       closed: this.closedSegments(),
     };
+  }
+
+  /** What a freshly loaded page needs: the live snapshot plus both runs' curves and the demand summary. */
+  state() {
+    return { ...this.snapshot(), speeds: SPEEDS, history: this.history, previous: this.previous, demand: this.demand() };
   }
 
   /** Record the evacuation curve; call after anything that changes the run. */
@@ -379,3 +384,4 @@ export class World {
 
 export type Snapshot = ReturnType<World["snapshot"]>;
 export type Stats = ReturnType<World["stats"]>;
+export type State = ReturnType<World["state"]>;

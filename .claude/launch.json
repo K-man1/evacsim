@@ -3,15 +3,9 @@
   "configurations": [
     {
       "name": "evacsim",
-      "runtimeExecutable": ".venv/bin/python",
-      "runtimeArgs": ["server.py"],
-      "port": 5050
-    },
-    {
-      "name": "evacsim-alt",
-      "runtimeExecutable": ".venv/bin/python",
-      "runtimeArgs": ["server.py", "--port", "5051"],
-      "port": 5051
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["vite", "--port", "5173", "--strictPort"],
+      "port": 5173
     }
   ]
 }
