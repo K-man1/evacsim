@@ -25,7 +25,7 @@ SPEEDS = [1, 3, 6, 12]  # sim steps per tick
 class World:
     """Everything the HTTP handlers touch, guarded by one lock."""
 
-    def __init__(self, n_cars: int):
+    def __init__(self, rate: int, shadow: int, warning: str):
         self.lock = threading.Lock()
         self.changed = threading.Condition(self.lock)
 
@@ -49,9 +49,21 @@ class World:
         self.build_segments()
         self.network_json = gzip.compress(json.dumps(self.network_payload(), separators=(",", ":")).encode())
 
-        self.n_cars = n_cars
-        self.scenario = sim.build_scenario(self.net, self.flood_geoms, self.district, n_cars, window_s=3600)
-        self.car_town = self.node_town[self.scenario.origins]
+        homes = gpd.read_file(DATA / "households.geojson")
+        self.home_areas = list(homes.geometry)
+        self.area_group = np.where(homes["zone"] == "shadow", sim.SHADOW, sim.FLOOD_ZONE)
+        # One evacuating car per household that has a vehicle; households without one need another way out.
+        self.vehicle_households = (homes["households"] - homes["no_vehicle"]).clip(lower=0).to_numpy()
+        n_towns = len(self.town_names) + 1
+        flood_homes = homes[homes["zone"] == "flood"]
+        home_town = flood_homes["town"].where(flood_homes["town"] >= 0, len(self.town_names)).to_numpy()
+        self.town_demand = {col: np.bincount(home_town, weights=flood_homes[col], minlength=n_towns)
+                            for col in ["people", "households", "no_vehicle", "no_vehicle_people"]}
+        shadow_homes = homes[homes["zone"] == "shadow"]
+        self.shadow_households = float(shadow_homes["households"].sum())
+        self.shadow_vehicle_households = float((shadow_homes["households"] - shadow_homes["no_vehicle"]).sum())
+
+        self.set_scenario(rate, shadow, warning)
         self.sim = sim.Sim(self.net, self.scenario, dt=DT)
         self.running = False
         self.speed = SPEEDS[2]
@@ -119,7 +131,10 @@ class World:
             "run": self.run_id,
             "t": s.t,
             "counts": s.counts(),
-            "total": self.n_cars,
+            # Progress and outcomes are about flood-zone residents; shadow cars are extra load on their roads.
+            "total": self.flood_total,
+            "flood_out": int(((s.state == sim.EVACUATED) & self.flood_car).sum()),
+            "cars": self.n_cars,
             "done": bool(s.done()),
             "running": self.running,
             "speed": self.speed,
@@ -131,19 +146,47 @@ class World:
 
     def publish(self):
         if self.sim.t > self.history[-1][0]:
-            self.history.append((self.sim.t, self.sim.counts()["evacuated"]))
+            self.history.append((self.sim.t, int(((self.sim.state == sim.EVACUATED) & self.flood_car).sum())))
         self.snapshot = self.make_snapshot()
         self.version += 1
         self.changed.notify_all()
 
-    def reset(self, n_cars=None):
+    def set_scenario(self, rate: int, shadow: int, warning: str):
+        """Rebuild demand: percent of flood-zone households leaving, percent of nearby households joining
+        them (shadow evacuation), and how much warning everyone had."""
+        self.rate, self.shadow, self.warning = rate, shadow, warning
+        share = np.where(self.area_group == sim.SHADOW, shadow, rate) / 100
+        self.scenario = sim.build_scenario(self.net, self.flood_geoms, self.district, self.home_areas,
+                                           self.vehicle_households * share, self.area_group,
+                                           departure_peak_s=sim.DEPARTURE_PEAK_S[warning])
+        self.n_cars = len(self.scenario.origins)
+        self.flood_car = self.scenario.group == sim.FLOOD_ZONE
+        self.flood_total = int(self.flood_car.sum())
+        self.car_town = self.node_town[self.scenario.origins]
+
+    def demand(self) -> dict:
+        d = self.town_demand
+        return {
+            "people": int(d["people"].sum()),
+            "households": int(d["households"].sum()),
+            "no_vehicle": int(d["no_vehicle"].sum()),
+            "no_vehicle_people": int(d["no_vehicle_people"].sum()),
+            "cars": int(self.flood_car.sum()),
+            "rate": self.rate,
+            "shadow": self.shadow,
+            "shadow_households": int(self.shadow_households),
+            "shadow_cars": int((~self.flood_car).sum()),
+            "warning": self.warning,
+        }
+
+    def reset(self, rate=None, shadow=None, warning=None):
         if len(self.history) > 2:
-            self.previous = {"total": self.n_cars, "done": bool(self.sim.done()), "points": self.history,
+            self.previous = {"total": self.flood_total, "done": bool(self.sim.done()), "points": self.history,
                              "summary": self.summary()}
-        if n_cars and n_cars != self.n_cars:
-            self.n_cars = n_cars
-            self.scenario = sim.build_scenario(self.net, self.flood_geoms, self.district, n_cars, window_s=3600)
-            self.car_town = self.node_town[self.scenario.origins]
+        settings = (rate if rate is not None else self.rate, shadow if shadow is not None else self.shadow,
+                    warning or self.warning)
+        if settings != (self.rate, self.shadow, self.warning):
+            self.set_scenario(*settings)
         # Closures are part of the scenario a planner is testing, so they survive a reset.
         self.sim = sim.Sim(self.net, self.scenario, dt=DT)
         self.history = [(0.0, 0)]
@@ -174,26 +217,36 @@ class World:
 
     def summary(self) -> dict:
         s = self.sim
-        counts = s.counts()
+        flood = self.flood_car
+        out = (s.state == sim.EVACUATED) & flood
+        resolved = out | ((s.state == sim.STRANDED) & flood)
         seg_delay = self.per_seg(s.delay_s)
         worst = int(seg_delay.argmax())
         return {
-            "cars": self.n_cars,
+            "cars": self.flood_total,
+            "shadow_cars": int((~flood).sum()),
+            "rate": self.rate,
+            "shadow": self.shadow,
+            "warning": self.warning,
             "closed": self.run_closed,
             "done": bool(s.done()),
-            "cleared_min": round(s.t / 60, 1) if s.done() else None,
-            "t50_min": self.time_to(0.5, self.history, self.n_cars),
-            "t90_min": self.time_to(0.9, self.history, self.n_cars),
-            "evacuated": counts["evacuated"],
-            "stranded": counts["stranded"],
-            **{k: (round(v, 2) if v is not None else None) for k, v in s.trip_stats().items()},
+            # Cleared = the last flood-zone resident who could get out did; shadow stragglers don't count.
+            "cleared_min": round(float(s.arrive_t[out].max()) / 60, 1) if resolved[flood].all() and out.any() else None,
+            "t50_min": self.time_to(0.5, self.history, self.flood_total),
+            "t90_min": self.time_to(0.9, self.history, self.flood_total),
+            "evacuated": int(out.sum()),
+            "stranded": int(((s.state == sim.STRANDED) & flood).sum()),
+            "stranded_all": int((s.state == sim.STRANDED).sum()),
+            **{k: (round(v, 2) if v is not None else None) for k, v in s.trip_stats(sim.FLOOD_ZONE).items()},
             "worst_road": (self.net.names[self.seg_rep[worst]] or "Unnamed road") if seg_delay[worst] > 0 else None,
         }
 
     def stats(self) -> dict:
         s = self.sim
         n_towns = len(self.town_names) + 1
-        ct = self.car_town
+        # Town rows describe flood-zone residents; shadow cars only show up as load on the roads.
+        ct = np.where(self.flood_car, self.car_town, n_towns)
+        n_towns += 1
         evac = s.state == sim.EVACUATED
         stranded = s.state == sim.STRANDED
         cars = np.bincount(ct, minlength=n_towns)
@@ -204,11 +257,14 @@ class World:
         trip = s.arrive_t - s.scenario.depart
         delay = trip - s.free_trip
         towns = []
-        for k in np.flatnonzero(cars):
+        d = self.town_demand
+        for k in np.flatnonzero((cars[:-1] > 0) | (d["households"] >= 0.5)):
             mine = evac & (ct == k)
             remaining = int(cars[k] - out[k] - stuck[k])
             towns.append({
                 "town": int(k), "cars": int(cars[k]), "evacuated": int(out[k]), "stranded": int(stuck[k]),
+                "people": int(round(d["people"][k])), "households": int(round(d["households"][k])),
+                "no_vehicle": int(round(d["no_vehicle"][k])), "no_vehicle_people": int(round(d["no_vehicle_people"][k])),
                 "remaining": remaining,
                 "cleared_min": round(last[k] / 60, 1) if remaining == 0 and out[k] else None,
                 "median_min": round(float(np.median(trip[mine])) / 60, 1) if mine.any() else None,
@@ -237,6 +293,7 @@ class World:
             "run": self.run_id,
             "t": s.t,
             "summary": self.summary(),
+            "demand": self.demand(),
             "previous": self.previous and self.previous["summary"],
             "towns": towns,
             "bottlenecks": bottlenecks,
@@ -306,7 +363,8 @@ def district():
 @app.get("/state")
 def state():
     with world.lock:
-        return jsonify(world.snapshot | {"speeds": SPEEDS, "history": world.history, "previous": world.previous})
+        return jsonify(world.snapshot | {"speeds": SPEEDS, "history": world.history, "previous": world.previous,
+                                         "demand": world.demand()})
 
 
 @app.get("/stream")
@@ -394,23 +452,35 @@ def speed():
 
 @app.post("/reset")
 def reset():
-    n_cars = request.get_json(silent=True, force=True) or {}
-    n_cars = n_cars.get("cars")
-    if n_cars is not None and not (isinstance(n_cars, int) and 1000 <= n_cars <= 200_000):
-        raise ValueError("cars must be an integer between 1,000 and 200,000")
-    return mutate(lambda: world.reset(n_cars))
+    body = request.get_json(silent=True, force=True) or {}
+    rate, shadow, warning = body.get("rate"), body.get("shadow"), body.get("warning")
+    if rate is not None and not (isinstance(rate, int) and 5 <= rate <= 100):
+        raise ValueError("rate must be a whole percent between 5 and 100")
+    if shadow is not None and not (isinstance(shadow, int) and 0 <= shadow <= 100):
+        raise ValueError("shadow must be a whole percent between 0 and 100")
+    if warning is not None and warning not in sim.DEPARTURE_PEAK_S:
+        raise ValueError(f"warning must be one of {list(sim.DEPARTURE_PEAK_S)}")
+    return mutate(lambda: world.reset(rate, shadow, warning))
 
 
 def main():
     global world
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cars", type=int, default=40_000)
+    parser.add_argument("--rate", type=int, default=100, help="percent of flood-zone households that evacuate")
+    # 20% is the planning convention from NRC evacuation-time studies (NUREG/CR-7002); floods have no standard.
+    parser.add_argument("--shadow", type=int, default=20,
+                        help="percent of households within 200 m of a flood zone that leave anyway")
+    parser.add_argument("--warning", choices=list(sim.DEPARTURE_PEAK_S), default="short",
+                        help="departure curve: sudden (~25 min), short (~1 h), long (~3 h)")
     parser.add_argument("--port", type=int, default=5050)  # 5000 is taken by AirPlay on macOS
     args = parser.parse_args()
 
-    world = World(args.cars)
+    world = World(args.rate, args.shadow, args.warning)
     threading.Thread(target=world.loop, daemon=True).start()
-    print(f"evacsim: {world.n_segs} roads, {args.cars} cars, http://localhost:{args.port}")
+    d = world.demand()
+    print(f"evacsim: {world.n_segs} roads; {d['people']:,} people in {d['households']:,} flood-zone households "
+          f"({d['no_vehicle']:,} without a vehicle); {d['cars']:,} flood-zone cars + {d['shadow_cars']:,} shadow "
+          f"cars, {args.warning} warning; http://localhost:{args.port}")
     app.run(host="0.0.0.0", port=args.port, threaded=True)
 
 

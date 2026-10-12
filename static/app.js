@@ -349,7 +349,6 @@ const runs = {
   current: { id: initial.run, points: toPoints(initial.history, initial.total) },
   previous: initial.previous && {
     points: toPoints(initial.previous.points, initial.previous.total),
-    clearedAt: initial.previous.done ? initial.previous.points.at(-1)[0] : null,
   },
 };
 
@@ -365,9 +364,8 @@ function applySnapshot(s) {
     runs.current = { id: s.run, points: [] };
   }
   const pts = runs.current.points;
-  const pct = (100 * s.counts.evacuated) / s.total;
+  const pct = (100 * s.flood_out) / s.total;
   if (!pts.length || s.t > pts[pts.length - 1].t) pts.push({ t: s.t, pct });
-  if (s.done) runs.current.clearedAt = s.t;
   const justFinished = s.done && !snap.done;
 
   load.fill(0);
@@ -404,13 +402,15 @@ function applySnapshot(s) {
 
 function renderResult() {
   const el = $("result");
-  if (runs.current.clearedAt == null) {
+  const sum = stats?.summary;
+  if (!snap.done || !sum || stats.run !== snap.run) {
     el.classList.remove("show");
     return;
   }
-  let html = `Cleared in <strong>${Math.round(runs.current.clearedAt / 60)} min</strong>`;
-  if (snap.counts.stranded) html += ` · <strong>${fmt(snap.counts.stranded)}</strong> stranded`;
-  if (stats?.summary.worst_road) html += ` · worst jam on <strong>${escapeHtml(stats.summary.worst_road)}</strong>`;
+  let html = `90% out by <strong>${minutes(sum.t90_min)} min</strong>`;
+  if (sum.cleared_min != null) html += ` · last at ${Math.round(sum.cleared_min)} min`;
+  if (sum.stranded) html += ` · <strong>${fmt(sum.stranded)}</strong> stranded`;
+  if (sum.worst_road) html += ` · worst jam on <strong>${escapeHtml(sum.worst_road)}</strong>`;
   $("result-text").innerHTML = html;
   el.classList.add("show");
 }
@@ -497,9 +497,14 @@ async function refreshStats() {
   maxFlow = stats.flow.cars.reduce((a, b) => Math.max(a, b), 1);
   version++;
 
+  renderDemand(stats.demand);
+  if (stats.demand.warning !== warning) { warning = stats.demand.warning; renderWarning(); }
   const sum = stats.summary;
   const tile = (v, unit) => (v == null ? "—" : `${unit === "veh-h" ? fmt(v) : minutes(v)}<small>${unit}</small>`);
   $("m-t90").innerHTML = tile(sum.t90_min, "min");
+  $("m-last").innerHTML = tile(sum.cleared_min, "min");
+  $("m-stranded").innerHTML = sum.stranded_all > sum.stranded
+    ? `${fmt(sum.stranded)}<small>+${fmt(sum.stranded_all - sum.stranded)} neighbors</small>` : fmt(sum.stranded);
   $("m-median").innerHTML = tile(sum.median_min, "min");
   $("m-delay").innerHTML = tile(sum.mean_delay_min, "min");
   $("m-vh").innerHTML = tile(sum.delay_veh_h, "veh-h");
@@ -513,6 +518,17 @@ async function refreshStats() {
   redraw();
 }
 setInterval(() => { if (snap.running) refreshStats(); }, 1000);
+
+function renderDemand(d) {
+  $("d-people").textContent = fmt(d.people);
+  $("d-households").textContent = fmt(d.households);
+  $("d-cars").innerHTML = d.shadow_cars ? `${fmt(d.cars)}<small>+${fmt(d.shadow_cars)} nbrs</small>` : fmt(d.cars);
+  $("d-novehicle").innerHTML = `${fmt(d.no_vehicle)}<small>households</small>`;
+  $("d-note").innerHTML = `<strong>${fmt(d.no_vehicle_people)}</strong> people live in flood-zone households with no vehicle. `
+    + `They aren't in the traffic sim and need buses or rides out. One car per household with a vehicle.`;
+  $("rate-sub").textContent = `${fmt(d.cars)} cars, one per household with a vehicle`;
+  $("shadow-sub").textContent = `${fmt(d.shadow_cars)} cars from ${fmt(d.shadow_households)} households within 200 m`;
+}
 
 function renderBottlenecks() {
   const list = $("bottlenecks");
@@ -559,26 +575,29 @@ let townSort = "risk";
 function renderTowns() {
   const body = $("towns").querySelector("tbody");
   const rows = [...(stats?.towns ?? [])];
-  const share = (t) => t.evacuated / t.cars;
+  const share = (t) => (t.cars ? t.evacuated / t.cars : 1);
   const sorters = {
-    risk: (a, b) => b.stranded - a.stranded || b.remaining - a.remaining || (b.cleared_min ?? 0) - (a.cleared_min ?? 0),
+    risk: (a, b) => b.stranded - a.stranded || b.remaining - a.remaining || (b.cleared_min ?? 0) - (a.cleared_min ?? 0)
+      || b.no_vehicle - a.no_vehicle,
     name: (a, b) => townNames[a.town].localeCompare(townNames[b.town]),
     cars: (a, b) => b.cars - a.cars,
     pct: (a, b) => share(a) - share(b),
     cleared: (a, b) => (b.cleared_min ?? Infinity) - (a.cleared_min ?? Infinity),
     stranded: (a, b) => b.stranded - a.stranded,
+    novehicle: (a, b) => b.no_vehicle - a.no_vehicle,
   };
   rows.sort(sorters[townSort]);
   for (const btn of $("towns").querySelectorAll("th button")) btn.setAttribute("aria-pressed", String(btn.dataset.sort === townSort));
   body.innerHTML = rows.map((t, k) => {
     const p = Math.floor(100 * share(t));
     return `<tr tabindex="0" data-town="${t.town}" style="animation-delay:${k * 18}ms" aria-current="${t.town === selectedTown}"
-        title="Median trip ${minutes(t.median_min)} min · avg delay ${minutes(t.delay_min)} min">
+        title="${fmt(t.people)} people in ${fmt(t.households)} flood-zone households · median trip ${minutes(t.median_min)} min · avg delay ${minutes(t.delay_min)} min">
       <td class="town-name" title="${escapeHtml(townNames[t.town])}">${escapeHtml(shortTown(t.town))}</td>
       <td class="r num">${fmt(t.cars)}</td>
-      <td class="r"><div class="out-cell"><span class="num">${p}%</span><div class="bar white"><i style="width:${p}%"></i></div></div></td>
+      <td class="r num">${p}%</td>
       <td class="r num ${t.cleared_min == null ? "dim" : ""}">${t.cleared_min == null ? "—" : `${Math.round(t.cleared_min)}m`}</td>
       <td class="r num ${t.stranded ? "crit" : "dim"}">${fmt(t.stranded)}</td>
+      <td class="r num ${t.no_vehicle ? "" : "dim"}" title="${fmt(t.no_vehicle_people)} people">${fmt(t.no_vehicle)}</td>
     </tr>`;
   }).join("");
   for (const tr of body.querySelectorAll("tr")) {
@@ -611,17 +630,22 @@ function focusTown(k) {
 
 // [label, summary key, unit, which direction is better: -1 lower, 0 neutral]
 const COMPARE_ROWS = [
-  ["Cleared in", "cleared_min", "min", -1],
   ["50% out by", "t50_min", "min", -1],
   ["90% out by", "t90_min", "min", -1],
-  ["Stranded", "stranded", "cars", -1],
+  ["Last one out", "cleared_min", "min", -1],
+  ["Stranded, flood zone", "stranded", "cars", -1],
+  ["Stranded, all", "stranded_all", "cars", -1],
   ["Median trip", "median_min", "min", -1],
   ["90th pct trip", "p90_min", "min", -1],
   ["Avg delay per car", "mean_delay_min", "min", -1],
   ["Total delay", "delay_veh_h", "veh-h", -1],
   ["Roads closed", "closed", "", 0],
-  ["Evacuating cars", "cars", "", 0],
+  ["Households leaving", "rate", "%", 0],
+  ["Neighbors leaving", "shadow", "%", 0],
+  ["Flood-zone cars", "cars", "", 0],
+  ["Neighbor cars", "shadow_cars", "", 0],
 ];
+const WARNING_LABEL = { sudden: "Sudden", short: "Hours", long: "A day" };
 const ARROW_UP = '<svg viewBox="0 0 10 10" fill="currentColor"><path d="M5 1 9.5 8h-9z"/></svg>';
 const ARROW_DOWN = '<svg viewBox="0 0 10 10" fill="currentColor"><path d="M5 9 .5 2h9z"/></svg>';
 
@@ -648,6 +672,7 @@ function renderCompare() {
       <td class="r num">${show(a, unit)}</td><td class="r num">${show(b, unit)}</td><td class="r">${change}</td></tr>`;
   });
   const road = (v) => `<td class="r text" title="${escapeHtml(v ?? "")}">${escapeHtml(v ?? "—")}</td>`;
+  rows.push(`<tr><td>Warning time</td><td class="r">${WARNING_LABEL[cur.warning]}</td><td class="r">${WARNING_LABEL[prev.warning] ?? "—"}</td><td></td></tr>`);
   rows.push(`<tr><td>Worst bottleneck</td>${road(cur.worst_road)}${road(prev.worst_road)}<td></td></tr>`);
   $("compare").querySelector("tbody").innerHTML = rows.join("");
 }
@@ -722,17 +747,34 @@ function renderSpeed(steps) {
   placeThumb(speedSeg, active);
 }
 
-const cars = $("cars");
+const rate = $("rate");
+const shadow = $("shadow");
+let warning = initial.demand.warning;
 const togglePlay = () => post(snap.running ? "/pause" : "/play");
-const resetRun = () => post("/reset", { cars: Number(cars.value) });
+const resetRun = () => post("/reset", { rate: Number(rate.value), shadow: Number(shadow.value), warning });
+const changeScenario = async () => { await resetRun(); refreshStats(); };
 $("play").onclick = togglePlay;
 $("reset").onclick = resetRun;
 
-cars.value = initial.total;
-const showCars = () => { $("cars-val").textContent = `${Math.round(cars.value / 1000)}k`; };
-showCars();
-cars.oninput = showCars;
-cars.onchange = resetRun;
+rate.value = initial.demand.rate;
+shadow.value = initial.demand.shadow;
+const showSliders = () => {
+  $("rate-val").textContent = `${rate.value}%`;
+  $("shadow-val").textContent = `${shadow.value}%`;
+};
+showSliders();
+rate.oninput = shadow.oninput = showSliders;
+rate.onchange = shadow.onchange = changeScenario;
+
+const warningSeg = $("warning");
+function renderWarning() {
+  const buttons = [...warningSeg.querySelectorAll("button")];
+  buttons.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.warning === warning)));
+  placeThumb(warningSeg, buttons.find((b) => b.dataset.warning === warning));
+}
+for (const b of warningSeg.querySelectorAll("button")) {
+  b.onclick = () => { warning = b.dataset.warning; renderWarning(); changeScenario(); };
+}
 
 addEventListener("keydown", (e) => {
   if (e.target instanceof HTMLInputElement) return;
@@ -748,11 +790,13 @@ placeDock();
 
 for (const [k, c] of Object.entries(counters)) c.set(initial.counts[k], { instant: true });
 applySnapshot(initial);
+renderWarning();
 setMode("queues");
 setTab("overview");
+renderDemand(initial.demand);
 await refreshStats();
 const events = new EventSource("/stream");
 events.onmessage = (e) => applySnapshot(JSON.parse(e.data));
-addEventListener("resize", () => { renderSpeed(snap.speed); setMode(mode); setTab(activeTab); });
+addEventListener("resize", () => { renderSpeed(snap.speed); renderWarning(); setMode(mode); setTab(activeTab); });
 
 $("loader").classList.add("gone");

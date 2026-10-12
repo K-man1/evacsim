@@ -209,14 +209,28 @@ def test_scenario_places_each_areas_cars_on_its_own_streets():
     ids = {n: i for i, n in enumerate(net.node_ids)}
 
     west = box(-0.5, -0.5, 1.5, 0.5)       # contains h1 and h2
-    sliver = box(5.2, 5.2, 5.3, 5.3)       # contains no intersection; the nearest is the arterial
+    sliver = box(10.1, 0.1, 10.2, 0.2)     # contains no intersection; the nearest is h3
+    by_arterial = box(4.5, 4.5, 5.5, 5.5)  # only intersection is the arterial, which already counts as safe
     flood = [box(-1, -1, 11, 1)]
-    scenario = sim.build_scenario(net, flood, box(-100, -100, 100, 100), [west, sliver], [400, 10], window_s=600)
+    scenario = sim.build_scenario(net, flood, box(-100, -100, 100, 100), [west, sliver, by_arterial],
+                                  [400, 10, 20], [sim.FLOOD_ZONE, sim.FLOOD_ZONE, sim.SHADOW], departure_peak_s=300)
 
     counts = np.bincount(scenario.origins, minlength=net.n_nodes)
-    assert counts.sum() == 410
-    assert counts[ids["h3"]] == 0
-    # h2 has three times h1's residential street, so it gets three times the cars.
-    assert counts[ids["h1"]] == 100 and counts[ids["h2"]] == 300
-    assert counts[ids["arterial"]] == 10
+    assert counts.sum() == 430
+    # h2 has three times h1's residential street, so it gets three times west's cars, plus the 20 from the
+    # arterial-side area, whose only intersection already counts as safe.
+    assert counts[ids["h1"]] == 100 and counts[ids["h2"]] == 300 + 20
+    assert counts[ids["h3"]] == 10
+    assert counts[ids["arterial"]] == 0, "nobody starts on a node that counts as safe"
     assert scenario.destinations[ids["arterial"]] and not scenario.destinations[ids["h1"]]
+    assert (scenario.group == sim.SHADOW).sum() == 20
+    assert np.all(np.diff(scenario.depart) >= 0)
+
+
+def test_departure_curve_matches_its_peak():
+    peak = 25 * 60
+    times = sim.departure_times(10_000, peak)
+    assert np.median(times) == pytest.approx(peak * np.sqrt(2 * np.log(2)), rel=0.01)
+    assert np.percentile(times, 95) == pytest.approx(peak * 2.448, rel=0.01)
+    counts, edges = np.histogram(times, bins=60)
+    assert edges[counts.argmax()] == pytest.approx(peak, rel=0.1)

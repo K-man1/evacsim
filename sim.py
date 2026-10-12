@@ -80,13 +80,32 @@ class Network:
         self.closed = np.zeros(self.n_edges, dtype=bool)
 
 
+FLOOD_ZONE, SHADOW = 0, 1
+
+# Departure curves, as the Rayleigh scale in seconds: the minute departures peak. 95% have left by 2.45x that.
+# Rayleigh-shaped mobilization curves are a common choice in evacuation modeling: a slow start while people
+# hear the order and pack, a peak, then a long tail of late leavers.
+DEPARTURE_PEAK_S = {
+    "sudden": 10 * 60,  # flash flood or overnight surge: 95% gone within ~25 min
+    "short": 25 * 60,   # a few hours of warning: 95% gone within ~1 h
+    "long": 75 * 60,    # day-ahead order: 95% gone within ~3 h
+}
+
+
+def departure_times(n: int, peak_s: float) -> np.ndarray:
+    """Evenly spaced quantiles of a Rayleigh curve, so a run's departures match the curve exactly."""
+    q = (np.arange(n) + 0.5) / n
+    return peak_s * np.sqrt(-2 * np.log1p(-q))
+
+
 class Scenario:
     """Who evacuates, from where, when, and what counts as safe."""
 
-    def __init__(self, origins, depart, destinations):
+    def __init__(self, origins, depart, destinations, group=None):
         self.origins = origins
         self.depart = depart
         self.destinations = destinations
+        self.group = np.zeros(len(origins), dtype=np.int8) if group is None else group
 
 
 def flooded_edges(net: Network, flood_geoms) -> np.ndarray:
@@ -97,12 +116,12 @@ def flooded_edges(net: Network, flood_geoms) -> np.ndarray:
     return flooded
 
 
-def build_scenario(net: Network, flood_geoms, district, home_areas, cars_per_area, window_s: float,
-                   safe_buffer_deg: float = 0.002, seed: int = 0) -> Scenario:
-    """Place cars on the streets of each flooded home area; send them to the nearest dry arterial or exit.
+def build_scenario(net: Network, flood_geoms, district, home_areas, cars_per_area, area_group,
+                   departure_peak_s: float, safe_buffer_deg: float = 0.002, seed: int = 0) -> Scenario:
+    """Place cars on the streets of each home area; send them to the nearest dry arterial or exit.
 
-    `home_areas` are polygons where people live inside the flood zone and `cars_per_area` is the expected
-    number of evacuating cars from each.
+    `home_areas` are polygons where people live, `cars_per_area` the expected evacuating cars from each,
+    and `area_group` marks each area FLOOD_ZONE or SHADOW (outside the zone but leaving anyway).
     """
     rng = np.random.default_rng(seed)
     points = [Point(xy) for xy in net.node_xy]
@@ -119,39 +138,54 @@ def build_scenario(net: Network, flood_geoms, district, home_areas, cars_per_are
     outside_district = ~np.array([district.contains(p) for p in points])
     destinations = (on_arterial | outside_district) & ~near_flood
 
+    # Cars can't start where they'd count as safe on the spot, or at intersections with no way to dry ground
+    # even with every road open (one-way stubs at the edge of the OSM extract): those would only report
+    # data gaps as stranded residents.
+    reverse = csr_matrix((np.ones(net.n_edges), (net.v, net.u)), shape=(net.n_nodes, net.n_nodes))
+    dist = dijkstra(reverse, indices=np.flatnonzero(destinations), min_only=True, unweighted=True)
+    usable = np.isfinite(dist) & ~destinations
+
     street = np.zeros(net.n_nodes)
     for e, cls in enumerate(net.highway):
         if cls in RESIDENTIAL:
             street[net.u[e]] += net.length[e]
 
-    # Within an area, cars start at intersections in proportion to the residential street leaving them.
     cars_per_area = np.asarray(cars_per_area, dtype=float)
+    area_group = np.asarray(area_group)
     node_tree = STRtree(points)
+    usable_nodes = np.flatnonzero(usable)
+    usable_tree = STRtree([points[n] for n in usable_nodes])
     area_idx, node_idx = node_tree.query(home_areas, predicate="contains")
+    area_idx, node_idx = area_idx[usable[node_idx]], node_idx[usable[node_idx]]
+    # Within an area, cars start at intersections in proportion to the residential street leaving them.
     pair_weight = street[node_idx]
     area_total = np.bincount(area_idx, weights=pair_weight, minlength=len(home_areas))
-    no_streets = area_total[area_idx] == 0
-    pair_weight[no_streets] = 1.0  # an area with only non-residential intersections still uses them
+    pair_weight[area_total[area_idx] == 0] = 1.0  # an area with only non-residential intersections still uses them
     area_total = np.bincount(area_idx, weights=pair_weight, minlength=len(home_areas))
-    expected = np.zeros(net.n_nodes)
-    np.add.at(expected, node_idx, cars_per_area[area_idx] * pair_weight / area_total[area_idx])
-
     # Small flooded slivers of a block often contain no intersection; their cars start at the nearest one.
     empty = np.flatnonzero(np.bincount(area_idx, minlength=len(home_areas)) == 0)
-    if len(empty):
-        nearest = node_tree.nearest([home_areas[a].representative_point() for a in empty])
-        np.add.at(expected, nearest, cars_per_area[empty])
+    nearest = usable_nodes[usable_tree.nearest([home_areas[a].representative_point() for a in empty])] \
+        if len(empty) else np.array([], dtype=np.int64)
 
-    n_cars = int(round(expected.sum()))
-    if n_cars == 0:
-        raise ValueError("no households in the flood zones; nothing to evacuate")
-    # Largest-remainder rounding: every intersection gets its expected count, not a random draw around it.
-    counts = np.floor(expected).astype(np.int64)
-    short = n_cars - counts.sum()
-    counts[np.argsort(counts - expected, kind="stable")[:short]] += 1
-    origins = rng.permutation(np.repeat(np.arange(net.n_nodes), counts))
-    depart = np.sort(rng.uniform(0, window_s, size=n_cars))
-    return Scenario(origins, depart, destinations)
+    origins, group = [], []
+    for g in (FLOOD_ZONE, SHADOW):
+        cars = np.where(area_group == g, cars_per_area, 0.0)
+        expected = np.zeros(net.n_nodes)
+        np.add.at(expected, node_idx, cars[area_idx] * pair_weight / area_total[area_idx])
+        np.add.at(expected, nearest, cars[empty])
+        n = int(round(expected.sum()))
+        # Largest-remainder rounding: every intersection gets its expected count, not a random draw around it.
+        counts = np.floor(expected).astype(np.int64)
+        counts[np.argsort(counts - expected, kind="stable")[:n - counts.sum()]] += 1
+        origins.append(np.repeat(np.arange(net.n_nodes), counts))
+        group.append(np.full(n, g, dtype=np.int8))
+    origins, group = np.concatenate(origins), np.concatenate(group)
+    if not len(origins):
+        raise ValueError("no households to evacuate")
+
+    # Which household leaves at which point on the curve is the one random choice left.
+    order = rng.permutation(len(origins))
+    return Scenario(origins[order], departure_times(len(origins), departure_peak_s), destinations, group[order])
 
 
 class Sim:
@@ -285,8 +319,10 @@ class Sim:
             hits[node] = closing[e] or hits[self.net.v[e]]
         return int(hits[self.pending_nodes()].sum())
 
-    def trip_stats(self) -> dict:
+    def trip_stats(self, group: int | None = None) -> dict:
         done = self.state == EVACUATED
+        if group is not None:
+            done &= self.scenario.group == group
         trip = self.arrive_t[done] - self.scenario.depart[done]
         delay = trip - self.free_trip[done]
         delay = delay[np.isfinite(delay)]

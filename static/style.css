@@ -214,6 +214,10 @@ kbd {
 .tile[data-alert="true"] .icon { display: inline; }
 .tile[data-alert="true"] dt { color: #f08a8a; }
 .section { margin-top: 18px; }
+.section-head { margin-top: 18px; }
+.source { text-transform: none; letter-spacing: 0; color: #4d4d4d; margin-left: 6px; }
+.note { margin: 8px 2px 0; font-size: 12px; color: var(--muted); }
+.note strong { color: var(--text); font-weight: 500; }
 
 /* Chart */
 .chart-head { display: flex; justify-content: space-between; align-items: baseline; }
@@ -271,7 +275,8 @@ td { padding: 7px 6px; border-bottom: 1px solid var(--border); font-variant-nume
 td.num { font-family: var(--mono); }
 #towns tbody tr { cursor: pointer; transition: background 0.15s; animation: fade 0.35s var(--ease) both; }
 #towns tbody tr:hover, #towns tbody tr[aria-current="true"] { background: var(--surface-3); }
-.town-name { max-width: 118px; overflow: hidden; text-overflow: ellipsis; }
+.town-name { max-width: 104px; overflow: hidden; text-overflow: ellipsis; }
+#towns th, #towns td { padding-left: 4px; padding-right: 4px; }
 .out-cell { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
 .out-cell .bar { width: 34px; margin: 0; }
 .crit { color: #f08a8a; }
@@ -285,7 +290,7 @@ td.num { font-family: var(--mono); }
 
 /* Left dock: scenario and legend */
 .dock {
-  position: fixed; left: 16px; bottom: 16px; z-index: 10; width: 300px;
+  position: fixed; left: 16px; bottom: 16px; z-index: 10; width: 310px;
   display: flex; flex-direction: column; gap: 10px;
 }
 .dock .card { padding: 14px; }
@@ -295,6 +300,11 @@ td.num { font-family: var(--mono); }
 input[type="range"] { -webkit-appearance: none; appearance: none; width: 104px; height: 4px; border-radius: 4px; background: var(--surface-3); }
 input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--text); cursor: pointer; }
 .cars-val { font: 500 13px var(--mono); min-width: 40px; text-align: right; }
+.slider-sub { font: 11px var(--mono); color: var(--faint); text-align: right; margin-top: 4px; }
+.setting { margin-top: 12px; }
+.setting label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+.setting .seg button { font-family: var(--sans); font-size: 12px; }
+.dock .row label { white-space: normal; line-height: 1.25; }
 #legend-title { margin-bottom: 6px; }
 .ramp { height: 6px; border-radius: 3px; background: linear-gradient(90deg, #8a3a12, #c9531d, #f07a3c, #ffb98c); }
 .ramp-labels { display: flex; justify-content: space-between; font: 11px var(--mono); color: var(--faint); margin-top: 4px; }

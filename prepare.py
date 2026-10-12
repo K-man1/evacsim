@@ -7,6 +7,7 @@ import pandas as pd
 import osmnx as ox
 import requests
 from requests.adapters import HTTPAdapter
+from shapely import STRtree
 from shapely.ops import unary_union
 from urllib3.util.retry import Retry
 
@@ -22,6 +23,9 @@ ACS_VEHICLES_URL = ("https://www2.census.gov/programs-surveys/acs/summary_file/2
 
 # Projected CRS for New Jersey (NAD83 / NJ State Plane, meters) so buffers are in real distance.
 NJ_CRS = "EPSG:32111"
+# Households within this distance of a flood zone, but not in it, are candidates for shadow evacuation.
+# NJ-12's floodplains are narrow stream corridors, so even 200 m reaches ~200k people.
+SHADOW_RING_M = 200
 
 # FEMA's NFHL server drops connections and 5xxs under load; retry with backoff instead of failing the whole run.
 session = requests.Session()
@@ -107,22 +111,27 @@ def fetch_households(district_poly, flood_path: Path, towns_path: Path, out: Pat
     blocks["no_vehicle_people"] = blocks["POP20"] * no_vehicle_rate
 
     district = gpd.GeoSeries([district_poly], crs="EPSG:4326").to_crs(NJ_CRS)[0]
-    blocks = blocks[blocks.intersects(district)]
-    flood = unary_union(gpd.read_file(flood_path).to_crs(NJ_CRS).geometry)
+    blocks = blocks[blocks.representative_point().within(district)]
+    flood_polys = list(gpd.read_file(flood_path).to_crs(NJ_CRS).geometry)
+    flood = unary_union(flood_polys)
     wet = blocks.geometry.intersection(flood)
     frac = (wet.area / blocks.geometry.area).clip(0, 1)
-    keep = frac > 0.001
+    _, gap = STRtree(flood_polys).query_nearest(blocks.representative_point().values, return_distance=True,
+                                                all_matches=False)
 
-    # Within a block, residents are assumed spread evenly, so the flooded share of its area is the flooded share of its people.
-    areas = gpd.GeoDataFrame({
-        "block": blocks["GEOID20"][keep],
-        "people": (blocks["POP20"] * frac)[keep],
-        "households": (blocks["households"] * frac)[keep],
-        "no_vehicle": (blocks["no_vehicle"] * frac)[keep],
-        "no_vehicle_people": (blocks["no_vehicle_people"] * frac)[keep],
-    }, geometry=wet[keep], crs=NJ_CRS)
-    areas = areas[areas.geom_type.isin(["Polygon", "MultiPolygon"]) | areas.geometry.geom_type.eq("GeometryCollection")]
-    areas["geometry"] = areas.geometry.buffer(0)
+    # Within a block, residents are assumed spread evenly, so the flooded share of its area is the flooded share
+    # of its people. The dry share of a block near the water is the shadow population.
+    counts = ["POP20", "households", "no_vehicle", "no_vehicle_people"]
+    flooded = frac > 0.001
+    shadow = (gap <= SHADOW_RING_M) & (frac < 0.999)
+    parts = []
+    for zone, mask, scale, geom in [("flood", flooded, frac, wet), ("shadow", shadow, 1 - frac, blocks.geometry)]:
+        part = gpd.GeoDataFrame(blocks.loc[mask, counts].mul(scale[mask], axis=0), geometry=geom[mask], crs=NJ_CRS)
+        part.insert(0, "zone", zone)
+        part.insert(0, "block", blocks.loc[mask, "GEOID20"])
+        parts.append(part)
+    areas = pd.concat(parts, ignore_index=True).rename(columns={"POP20": "people"})
+    areas["geometry"] = areas.geometry.buffer(0)  # drops the stray lines and points intersections leave behind
     areas = areas[~areas.geometry.is_empty].to_crs("EPSG:4326")
 
     towns = gpd.read_file(towns_path)
@@ -132,8 +141,10 @@ def fetch_households(district_poly, flood_path: Path, towns_path: Path, out: Pat
     for col in ["people", "households", "no_vehicle", "no_vehicle_people"]:
         areas[col] = areas[col].round(2)
     areas.to_file(out, driver="GeoJSON")
-    print(f"households: {len(areas)} flooded block areas, {areas['people'].sum():,.0f} people, "
-          f"{areas['households'].sum():,.0f} households, {areas['no_vehicle'].sum():,.0f} without a vehicle, saved {out}")
+    for zone, group in areas.groupby("zone"):
+        print(f"households ({zone}): {len(group)} block areas, {group['people'].sum():,.0f} people, "
+              f"{group['households'].sum():,.0f} households, {group['no_vehicle'].sum():,.0f} without a vehicle")
+    print(f"saved {out}")
 
 
 def fetch_roads(district_poly, out: Path):
