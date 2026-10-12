@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "evacsim",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["server.py"],
+      "port": 5050
+    },
+    {
+      "name": "evacsim-alt",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["server.py", "--port", "5051"],
+      "port": 5051
+    }
+  ]
+}

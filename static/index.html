@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>evacsim · NJ-12</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/deck.gl@9.1.14/dist.min.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="map"></div>
+  <canvas id="sparks"></canvas>
+
+  <header class="topbar card" style="--i:0">
+    <div class="mark" aria-hidden="true">
+      <svg viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M2 11c2-2 4-2 6 0s4 2 6 0M8 2v6m0 0L5.5 5.5M8 8l2.5-2.5"/>
+      </svg>
+    </div>
+    <div class="brand">
+      <h1 class="shiny">evacsim</h1>
+      <p>NJ-12 · FEMA 100-year floodplain</p>
+    </div>
+    <div class="divider"></div>
+    <span class="pill" id="status" data-state="paused"><span class="dot"></span><span id="status-text">Ready</span></span>
+  </header>
+
+  <nav class="modes card" style="--i:1" aria-label="Map layer">
+    <div class="seg" id="modes">
+      <span class="thumb"></span>
+      <button data-mode="queues" aria-pressed="true">Live queues</button>
+      <button data-mode="delay" aria-pressed="false">Delay caused</button>
+      <button data-mode="routes" aria-pressed="false">Planned routes</button>
+    </div>
+  </nav>
+
+  <aside class="panel" id="panel">
+    <section class="card" style="--i:2">
+      <p class="eyebrow">Simulation clock</p>
+      <div class="clock">
+        <time id="clock">00:00:00</time>
+        <span class="pct" id="pct">0% out</span>
+      </div>
+      <div class="progress"><span id="progress"></span></div>
+      <div class="result" id="result"><div id="result-text"></div></div>
+      <div class="controls">
+        <button class="btn primary grow" id="play">
+          <svg id="play-icon" viewBox="0 0 16 16" fill="currentColor"><path d="M4 2.8v10.4a.6.6 0 0 0 .9.5l8.4-5.2a.6.6 0 0 0 0-1L4.9 2.3a.6.6 0 0 0-.9.5z"/></svg>
+          <span id="play-label">Run</span> <kbd>Space</kbd>
+        </button>
+        <button class="btn" id="reset" title="Reset run (R)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2.5 8a5.5 5.5 0 1 0 1.7-4M2.5 2.5V5H5"/></svg>
+          Reset
+        </button>
+      </div>
+      <div class="row">
+        <label>Speed</label>
+        <div class="seg" id="speed" role="group" aria-label="Simulation speed"><span class="thumb"></span></div>
+      </div>
+    </section>
+
+    <section class="card tabs-card" style="--i:3">
+      <div class="tabbar" role="tablist" id="tabbar">
+        <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+        <button role="tab" data-tab="bottlenecks" aria-selected="false">Bottlenecks</button>
+        <button role="tab" data-tab="towns" aria-selected="false">Towns</button>
+        <button role="tab" data-tab="compare" aria-selected="false">Compare<span class="badge" id="compare-badge" hidden>vs prev</span></button>
+        <span class="underline"></span>
+      </div>
+      <div class="tab-body">
+        <div class="tab-panel" data-panel="overview">
+          <dl class="tiles">
+            <div class="tile"><dt>Evacuated</dt><dd id="n-evacuated">0</dd></div>
+            <div class="tile"><dt>On the road</dt><dd id="n-on_road">0</dd></div>
+            <div class="tile"><dt>Not yet left</dt><dd id="n-waiting">0</dd></div>
+            <div class="tile" id="stranded-tile">
+              <dt><svg class="icon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.5 15 14H1L8 1.5zm-.75 4.5v4h1.5V6h-1.5zm0 5v1.5h1.5V11h-1.5z"/></svg>Stranded</dt>
+              <dd id="n-stranded">0</dd>
+            </div>
+          </dl>
+          <div class="section">
+            <p class="eyebrow">Trip outcomes, evacuated cars</p>
+            <dl class="tiles">
+              <div class="tile"><dt>90% out by</dt><dd id="m-t90">—</dd></div>
+              <div class="tile"><dt>Median trip</dt><dd id="m-median">—</dd></div>
+              <div class="tile"><dt>Avg delay per car</dt><dd id="m-delay">—</dd></div>
+              <div class="tile"><dt>Total delay</dt><dd id="m-vh">—</dd></div>
+            </dl>
+          </div>
+          <div class="section">
+            <div class="chart-head">
+              <p class="eyebrow">Evacuated over time</p>
+              <div class="legend"><span><i></i>This run</span><span id="legend-prev" hidden><i class="prev"></i>Previous</span></div>
+            </div>
+            <div class="chart-wrap">
+              <svg id="chart" role="img" aria-label="Percent of cars evacuated over simulated time"></svg>
+              <div class="chart-tip" id="chart-tip"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-panel" data-panel="bottlenecks" hidden>
+          <p class="lede">Roads ranked by the delay they cause. Queues spill back upstream, so delay is charged to the road at the front of the jam. Click one to inspect it.</p>
+          <div class="list" id="bottlenecks"></div>
+        </div>
+
+        <div class="tab-panel" data-panel="towns" hidden>
+          <p class="lede">Municipalities with residents in the flood zone. Click a row to zoom to it.</p>
+          <table id="towns">
+            <thead><tr>
+              <th><button data-sort="name">Town</button></th>
+              <th class="r"><button data-sort="cars">Cars</button></th>
+              <th class="r"><button data-sort="pct">Out</button></th>
+              <th class="r"><button data-sort="cleared">Cleared</button></th>
+              <th class="r"><button data-sort="stranded">Stranded</button></th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="tab-panel" data-panel="compare" hidden>
+          <p class="lede">This run against the one before it. Change roads, reset, and run again to test a decision.</p>
+          <table class="compare" id="compare">
+            <thead><tr><th>Metric</th><th class="r">This run</th><th class="r">Previous</th><th class="r">Change</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div class="empty" id="compare-empty">Finish a run, then reset and run again to compare.</div>
+        </div>
+      </div>
+    </section>
+  </aside>
+
+  <div class="dock" id="dock">
+    <section class="card" style="--i:4">
+      <p class="eyebrow">Scenario</p>
+      <button class="btn bridge-btn" id="close-bridges" data-state="idle">
+        <span class="icon">
+          <svg class="i-bridge" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M1 6h14M3 6v6M13 6v6M3 6c1.5 2 3.5 3 5 3s3.5-1 5-3"/></svg>
+          <svg class="i-spin" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 1.5a6.5 6.5 0 1 0 6.5 6.5"/></svg>
+          <svg class="i-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 6.5 12 13 4.5"/></svg>
+        </span>
+        <span class="label"><span id="bridge-title">Close flooded bridges</span><span class="sub" id="bridge-sub">Simulates the rivers rising</span></span>
+      </button>
+      <div class="row">
+        <span class="closed-count" id="closed-count">0 roads closed</span>
+        <button class="btn small" id="open-all">Reopen all</button>
+      </div>
+      <div class="row">
+        <label for="cars">Evacuating cars</label>
+        <div class="slider">
+          <input type="range" id="cars" min="5000" max="100000" step="5000">
+          <span class="cars-val" id="cars-val"></span>
+        </div>
+      </div>
+    </section>
+    <section class="card" style="--i:5">
+      <p class="eyebrow" id="legend-title">Road load, queue ÷ capacity</p>
+      <div class="ramp"></div>
+      <div class="ramp-labels"><span id="legend-lo">Light</span><span id="legend-hi">Jammed</span></div>
+      <div class="keys">
+        <span><i class="sw flood"></i>FEMA special flood hazard area</span>
+        <span><i class="sw closed"></i>Closed road</span>
+        <span><i class="sw stranded"></i>Stranded cars, no dry route</span>
+      </div>
+    </section>
+    <div class="attrib">Roads © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · Basemap © Esri · FEMA NFHL · US Census TIGER</div>
+  </div>
+
+  <div class="toast-wrap" id="toasts" role="status" aria-live="polite"></div>
+  <div id="tooltip"></div>
+  <div class="loader" id="loader"><p class="shiny">Loading NJ-12 road network</p></div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
