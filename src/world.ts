@@ -6,6 +6,19 @@ export const DT = 5;
 export const TICK_S = 0.1;
 export const SPEEDS = [1, 3, 6, 12]; // sim steps per tick
 
+export interface ZonePlan {
+  town: number;
+  orderTimeS: number;
+  participation: number;
+}
+
+export interface RoadAction {
+  segment: number;
+  startsAtS: number;
+  kind: "close" | "capacity";
+  multiplier?: number;
+}
+
 export interface NetworkJson {
   arrays: Record<string, [string, number, number]>;
   n_nodes: number;
@@ -59,6 +72,10 @@ export class World {
   rate = 100;
   shadow = 20;
   warning: Warning = "short";
+  zones: ZonePlan[] = [];
+  roadActions: RoadAction[] = [];
+  appliedRoadActions = new Set<number>();
+  closedByRoadActions = new Set<number>();
   scenario!: Scenario;
   floodCar!: Uint8Array;
   floodTotal = 0;
@@ -97,12 +114,40 @@ export class World {
 
   /** Rebuild demand: percent of flood-zone households leaving, percent of nearby households joining them
    * (shadow evacuation), and how much warning everyone had. */
-  setScenario(rate: number, shadow: number, warning: Warning) {
+  setScenario(rate: number, shadow: number, warning: Warning, zones?: ZonePlan[]) {
     this.rate = rate;
     this.shadow = shadow;
     this.warning = warning;
     const { expectedFlood, expectedShadow, destination, nodeTown } = this.a;
-    this.scenario = buildScenario(expectedFlood, expectedShadow, destination, rate, shadow, warning);
+    const byTown = new Map((zones ?? []).map((zone) => [zone.town, zone]));
+    this.zones = this.meta.towns.map((_, town) => {
+      const zone = byTown.get(town);
+      return {
+        town,
+        orderTimeS: Math.max(0, zone?.orderTimeS ?? 0),
+        participation: Math.max(0, Math.min(100, zone?.participation ?? rate)),
+      };
+    });
+    const floodWeights = Float64Array.from(expectedFlood, (weight, node) => {
+      const zone = this.zones[nodeTown[node]];
+      return weight * (zone?.participation ?? rate) / 100;
+    });
+    const built = buildScenario(floodWeights, expectedShadow, destination, 100, shadow, warning);
+    const order = Array.from(built.origins, (_, car) => car).sort((a, b) => {
+      const townA = nodeTown[built.origins[a]], townB = nodeTown[built.origins[b]];
+      const departA = built.depart[a] + (built.group[a] === FLOOD_ZONE ? (this.zones[townA]?.orderTimeS ?? 0) : 0);
+      const departB = built.depart[b] + (built.group[b] === FLOOD_ZONE ? (this.zones[townB]?.orderTimeS ?? 0) : 0);
+      return departA - departB;
+    });
+    this.scenario = {
+      origins: Int32Array.from(order, (car) => built.origins[car]),
+      depart: Float64Array.from(order, (car) => {
+        const town = nodeTown[built.origins[car]];
+        return built.depart[car] + (built.group[car] === FLOOD_ZONE ? (this.zones[town]?.orderTimeS ?? 0) : 0);
+      }),
+      destinations: built.destinations,
+      group: Int8Array.from(order, (car) => built.group[car]),
+    };
     this.floodCar = Uint8Array.from(this.scenario.group, (g) => Number(g === FLOOD_ZONE));
     this.floodTotal = this.floodCar.reduce((a, b) => a + b, 0);
     this.carTown = Int32Array.from(this.scenario.origins, (o) => nodeTown[o]);
@@ -175,6 +220,17 @@ export class World {
   tick() {
     if (!this.running) return false;
     for (let i = 0; i < this.speed; i++) {
+      for (let action = 0; action < this.roadActions.length; action++) {
+        const planned = this.roadActions[action];
+        if (!this.appliedRoadActions.has(action) && this.sim.t >= planned.startsAtS) {
+          if (planned.kind === "capacity") {
+            this.setCapacity([planned.segment], planned.multiplier ?? 1);
+          } else if (this.setSegments([planned.segment], true).changed) {
+            this.closedByRoadActions.add(planned.segment);
+          }
+          this.appliedRoadActions.add(action);
+        }
+      }
       this.sim.step();
       if (this.sim.done()) {
         this.running = false;
@@ -199,15 +255,24 @@ export class World {
       shadow_households: Math.round(this.meta.shadow_households),
       shadow_cars: this.nCars - this.floodTotal,
       warning: this.warning,
+      zones: this.zones.filter((zone) => this.meta.demand.households[zone.town] >= 0.5),
     };
   }
 
-  reset(rate?: number, shadow?: number, warning?: Warning) {
+  reset(rate?: number, shadow?: number, warning?: Warning, zones?: ZonePlan[], roadActions?: RoadAction[]) {
     if (this.history.length > 2) {
       this.previous = { total: this.floodTotal, done: this.sim.done(), points: this.history, summary: this.summary() };
     }
+    if (this.closedByRoadActions.size) this.setSegments([...this.closedByRoadActions], false);
+    this.appliedRoadActions.clear();
+    this.closedByRoadActions.clear();
+    if (roadActions) this.roadActions = roadActions
+      .filter((action) => action.segment >= 0 && action.segment < this.nSegs && action.startsAtS >= 0)
+      .sort((a, b) => a.startsAtS - b.startsAtS);
     const next: [number, number, Warning] = [rate ?? this.rate, shadow ?? this.shadow, warning ?? this.warning];
-    if (next[0] !== this.rate || next[1] !== this.shadow || next[2] !== this.warning) this.setScenario(...next);
+    if (next[0] !== this.rate || next[1] !== this.shadow || next[2] !== this.warning || zones) {
+      this.setScenario(...next, zones);
+    }
     // Closures are part of the scenario a planner is testing, so they survive a reset.
     this.sim = new Sim(this.net, this.scenario, { dt: DT });
     this.history = [[0, 0]];
@@ -234,6 +299,16 @@ export class World {
     this.sim.reroute();
     if (!this.sim.done()) this.runClosed = this.closedSegments().length;
     return { changed: changedSegs.size, affected };
+  }
+
+  setCapacity(segs: number[], multiplier: number) {
+    for (const segment of segs) {
+      for (let k = this.segStart[segment]; k < this.segStart[segment + 1]; k++) {
+        const edge = this.segEdges[k];
+        this.sim.flowCap[edge] = this.net.flowVph[edge] * this.sim.dt / 3600 * multiplier;
+      }
+    }
+    this.sim.reroute();
   }
 
   floodedBridges(): number[] {
@@ -299,6 +374,7 @@ export class World {
       mean_delay_min: r2(trip.mean_delay_min),
       delay_veh_h: r2(trip.delay_veh_h),
       worst_road: segDelay[worst] > 0 ? this.meta.names[worst] || "Unnamed road" : null,
+      scheduled_closures: this.roadActions.length,
     };
   }
 
@@ -349,9 +425,23 @@ export class World {
     const segQueue = this.perSeg(s.occupancy);
     const closed = new Set(this.closedSegments());
     const ranked = Array.from(segDelay.keys()).sort((x, y) => segDelay[y] - segDelay[x]).slice(0, 12);
-    const bottlenecks = ranked.filter((g) => segDelay[g] > 0).map((g) => ({
+    const bottleneckSegs = ranked.filter((g) => segDelay[g] > 0);
+    const targetEdges: number[] = [], targetSegment: number[] = [];
+    bottleneckSegs.forEach((g, index) => {
+      for (let k = this.segStart[g]; k < this.segStart[g + 1]; k++) {
+        targetEdges.push(this.segEdges[k]);
+        targetSegment.push(index);
+      }
+    });
+    const groupFlow = bottleneckSegs.map(() => new Int32Array(nTowns));
+    s.plannedGroups(targetEdges, this.carTown, nTowns).forEach((groups, edge) => {
+      groups.forEach((cars, town) => { groupFlow[targetSegment[edge]][town] += cars; });
+    });
+    const bottlenecks = bottleneckSegs.map((g, index) => ({
       seg: g, delay_veh_h: round(segDelay[g] / 60, 1), queued: segQueue[g], flow: segFlow[g],
       town: this.meta.town[g], at: [round(this.a.segMidX[g], 5), round(this.a.segMidY[g], 5)], closed: closed.has(g),
+      contributors: Array.from(groupFlow[index], (cars, town) => ({ town, cars }))
+        .filter((row) => row.cars > 0).sort((a, b) => b.cars - a.cars).slice(0, 3),
     }));
 
     const stuckAt = new Map<number, number>();

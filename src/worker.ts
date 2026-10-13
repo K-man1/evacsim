@@ -1,6 +1,6 @@
 // Runs the simulation off the main thread so a reroute never stalls map panning. Replaces the Flask server:
 // each request from the page is a former endpoint, and snapshots replace the SSE stream.
-import { World, TICK_S, type NetworkJson } from "./world.ts";
+import { World, TICK_S, type NetworkJson, type RoadAction, type ZonePlan } from "./world.ts";
 import type { Warning } from "./sim.ts";
 
 export type Command =
@@ -9,7 +9,7 @@ export type Command =
   | { cmd: "close" | "open"; segs: number[] }
   | { cmd: "closeFloodedBridges" | "openAll" | "play" | "pause" }
   | { cmd: "speed"; steps: number }
-  | { cmd: "reset"; rate?: number; shadow?: number; warning?: Warning };
+  | { cmd: "reset"; rate?: number; shadow?: number; warning?: Warning; zones?: ZonePlan[]; roadActions?: RoadAction[] };
 
 export type FromWorker =
   | { type: "reply"; id: number; result?: unknown; error?: string }
@@ -55,7 +55,7 @@ function mutate(c: Exclude<Command, { cmd: "state" | "stats" }>) {
       world.speed = c.steps;
       return;
     case "reset":
-      return world.reset(c.rate, c.shadow, c.warning);
+      return world.reset(c.rate, c.shadow, c.warning, c.zones, c.roadActions);
   }
 }
 

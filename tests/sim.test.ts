@@ -198,6 +198,14 @@ test("planned flow and closure impact follow routes", () => {
   assert.equal(s.carsAffected(closing), 200);
 });
 
+test("planned route groups explain who uses a bottleneck", () => {
+  const { s, edgeId } = makeSim(bridgeTown, [...repeat("a", 3), ...repeat("b", 2)], ["safe"]);
+  const groups = Int32Array.from([0, 0, 0, 1, 1]);
+  const bridge = edgeId("x", "y");
+  const [flow] = s.plannedGroups([bridge], groups, 2);
+  assert.deepEqual([...flow], [3, 2]);
+});
+
 test("scenario rounding gives every node its expected cars", () => {
   const flood = Float64Array.from([100.4, 299.6, 0, 10]);
   const shadow = Float64Array.from([0, 20, 0, 0]);

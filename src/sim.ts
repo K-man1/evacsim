@@ -331,6 +331,32 @@ export class Sim {
     return flow;
   }
 
+  /** Cars whose current route uses each requested edge, grouped by the caller's car labels. */
+  plannedGroups(edges: number[], groupOfCar: ArrayLike<number>, nGroups: number): Int32Array[] {
+    const target = new Map(edges.map((edge, index) => [edge, index]));
+    const groups = edges.map(() => new Int32Array(nGroups));
+    const nxt = this.trees.get(this.latestTree)!;
+    for (let car = 0; car < this.state.length; car++) {
+      if (this.state[car] > ON_ROAD) continue;
+      const group = groupOfCar[car];
+      let node = this.scenario.origins[car];
+      if (this.state[car] === ON_ROAD) {
+        const edge = this.edgeOfCar[car];
+        const index = target.get(edge);
+        if (index !== undefined) groups[index][group]++;
+        node = this.net.v[edge];
+      }
+      for (let steps = 0; steps < this.net.nNodes; steps++) {
+        const edge = nxt[node];
+        if (edge < 0) break;
+        const index = target.get(edge);
+        if (index !== undefined) groups[index][group]++;
+        node = this.net.v[edge];
+      }
+    }
+    return groups;
+  }
+
   /** How many cars' current best routes cross any edge in the `closing` mask. */
   carsAffected(closing: Uint8Array): number {
     const nxt = this.trees.get(this.latestTree)!;

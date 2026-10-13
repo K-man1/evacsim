@@ -9,7 +9,7 @@ import type { Feature, FeatureCollection, Position } from "geojson";
 import { clickSpark, countUp } from "./bits.ts";
 import type { Warning } from "./sim.ts";
 import type { Command, FromWorker } from "./worker.ts";
-import type { NetworkJson, Snapshot, State, Stats } from "./world.ts";
+import type { NetworkJson, RoadAction, Snapshot, State, Stats, ZonePlan } from "./world.ts";
 
 type Rgb = [number, number, number];
 type Road = { i: number; path: [number, number][]; cls: string; name: string; flags: number; storage: number; town: number };
@@ -18,6 +18,26 @@ type Tab = "overview" | "bottlenecks" | "towns" | "compare";
 type Summary = Stats["summary"];
 type TownRow = Stats["towns"][number];
 type Point = { t: number; pct: number };
+type SavedPlan = {
+  name: string;
+  summary: Summary;
+  rate: number;
+  shadow: number;
+  warning: Warning;
+  zones: ZonePlan[];
+  roadActions: RoadAction[];
+};
+
+function loadSavedPlans(): SavedPlan[] {
+  try {
+    const value = JSON.parse(localStorage.getItem("evacsim-plans") ?? "[]");
+    return Array.isArray(value) ? value : [];
+  } catch {
+    return [];
+  }
+}
+
+let savedPlans = loadSavedPlans();
 
 const FLAG_BRIDGE = 1, FLAG_FLOODED = 2;
 const ROAD_STYLE: Record<string, [Rgb, number]> = {
@@ -592,20 +612,42 @@ function renderBottlenecks() {
     const tags = (r.flags & FLAG_BRIDGE ? '<span class="tag">bridge</span>' : "")
       + (r.flags & FLAG_FLOODED ? '<span class="tag flood">floodplain</span>' : "")
       + (b.closed ? '<span class="tag closed">closed</span>' : "");
+    const contributors = b.contributors.length
+      ? b.contributors.map((row) => `${shortTown(row.town)} ${fmt(row.cars)}`).join(" · ") : "No active routes use it";
+    const action = roadActions.find((candidate) => candidate.segment === b.seg);
+    const actionChoice = action?.kind === "capacity" ? action.multiplier === 0.5 ? "half" : "boost" : "close";
+    const option = (value: string, label: string) => `<option value="${value}"${actionChoice === value ? " selected" : ""}>${label}</option>`;
     return `<div class="list-row" tabindex="0" style="--k:${k}" data-seg="${b.seg}" aria-current="${b.seg === selectedSeg}">
       <span class="rank">${k + 1}</span>
       <div class="row-main">
         <div class="row-title">${escapeHtml(roadLabel(r))}</div>
         <div class="row-sub">${escapeHtml(townNames[b.town])} ${tags}</div>
+        <div class="row-sub">Traffic from ${escapeHtml(contributors)}</div>
         <div class="bar"><i style="width:${(100 * b.delay_veh_h) / top}%"></i></div>
       </div>
       <div class="row-val"><b>${b.delay_veh_h.toFixed(1)} veh-h</b><span>${fmt(b.queued)} queued · ${fmt(b.flow)} routed</span></div>
+      <div class="closure-plan"><select aria-label="Action for ${escapeHtml(roadLabel(r))}">${option("close", "Close")}${option("half", "50% capacity")}${option("boost", "150% capacity")}</select><input type="number" min="0" max="300" step="5" value="${Math.round((action?.startsAtS ?? 1800) / 60)}" aria-label="Action time for ${escapeHtml(roadLabel(r))} in minutes"><button class="btn" data-schedule="${b.seg}">${action ? "Update" : "Schedule"}</button></div>
     </div>`;
   }).join("");
   for (const row of list.querySelectorAll<HTMLElement>(".list-row")) {
     const go = () => focusSegment(Number(row.dataset.seg));
-    row.onclick = go;
+    row.onclick = (e) => { if (!(e.target as HTMLElement).closest(".closure-plan")) go(); };
     row.onkeydown = (e) => { if (e.key === "Enter") go(); };
+  }
+  for (const button of list.querySelectorAll<HTMLButtonElement>("[data-schedule]")) {
+    button.onclick = async () => {
+      const segment = Number(button.dataset.schedule);
+      const input = button.parentElement!.querySelector<HTMLInputElement>("input")!;
+      const choice = button.parentElement!.querySelector<HTMLSelectElement>("select")!.value;
+      const startsAtS = Math.max(0, Math.min(300, Number(input.value))) * 60;
+      roadActions = roadActions.filter((action) => action.segment !== segment);
+      roadActions.push({ segment, startsAtS, kind: choice === "close" ? "close" : "capacity",
+        multiplier: choice === "half" ? 0.5 : choice === "boost" ? 1.5 : undefined });
+      toast("closed", `${roadLabel(roads[segment])} action scheduled`, `${Math.round(startsAtS / 60)} minutes after the run starts`);
+      renderRoadActions();
+      await changeScenario();
+      renderBottlenecks();
+    };
   }
 }
 
@@ -692,6 +734,7 @@ const COMPARE_ROWS: [string, NumericKey, string, number][] = [
   ["Avg delay per car", "mean_delay_min", "min", -1],
   ["Total delay", "delay_veh_h", "veh-h", -1],
   ["Roads closed", "closed", "", 0],
+  ["Scheduled closures", "scheduled_closures", "", 0],
   ["Households leaving", "rate", "%", 0],
   ["Neighbors leaving", "shadow", "%", 0],
   ["Flood-zone cars", "cars", "", 0],
@@ -727,6 +770,46 @@ function renderCompare() {
   rows.push(`<tr><td>Warning time</td><td class="r">${WARNING_LABEL[cur.warning]}</td><td class="r">${WARNING_LABEL[prev.warning] ?? "—"}</td><td></td></tr>`);
   rows.push(`<tr><td>Worst bottleneck</td>${road(cur.worst_road)}${road(prev.worst_road)}<td></td></tr>`);
   $("compare").querySelector("tbody")!.innerHTML = rows.join("");
+  renderSavedPlans();
+}
+
+function renderSavedPlans() {
+  const list = $("saved-plans");
+  if (!savedPlans.length) {
+    list.innerHTML = '<div class="empty">Save completed runs to compare and reopen them later.</div>';
+    return;
+  }
+  list.innerHTML = savedPlans.map((plan, index) => `<div class="saved-plan">
+    <strong title="${escapeHtml(plan.name)}">${escapeHtml(plan.name)}</strong>
+    <span>${minutes(plan.summary.t90_min)}m to 90%</span>
+    <span>${fmt(plan.summary.stranded)} stranded</span>
+    <span>${minutes(plan.summary.mean_delay_min)}m delay</span>
+    <button class="btn small" data-load-plan="${index}">Load</button>
+    <button class="btn small" data-remove-plan="${index}" aria-label="Remove ${escapeHtml(plan.name)}">×</button>
+  </div>`).join("");
+  for (const button of list.querySelectorAll<HTMLButtonElement>("[data-load-plan]")) {
+    button.onclick = async () => {
+      const plan = savedPlans[Number(button.dataset.loadPlan)];
+      rate.value = String(plan.rate);
+      shadow.value = String(plan.shadow);
+      warning = plan.warning;
+      zonePlans = plan.zones.map((zone) => ({ ...zone }));
+      roadActions = plan.roadActions.map((action) => ({ ...action }));
+      showSliders();
+      renderWarning();
+      renderSchedule();
+      renderRoadActions();
+      await changeScenario();
+      setTab("overview");
+    };
+  }
+  for (const button of list.querySelectorAll<HTMLButtonElement>("[data-remove-plan]")) {
+    button.onclick = () => {
+      savedPlans.splice(Number(button.dataset.removePlan), 1);
+      localStorage.setItem("evacsim-plans", JSON.stringify(savedPlans));
+      renderSavedPlans();
+    };
+  }
 }
 
 // Map layer switch and legend
@@ -803,21 +886,108 @@ function renderSpeed(steps: number) {
 const rate = $<HTMLInputElement>("rate");
 const shadow = $<HTMLInputElement>("shadow");
 let warning: Warning = initial.demand.warning;
+let zonePlans: ZonePlan[] = initial.demand.zones.map((zone) => ({ ...zone }));
+let roadActions: RoadAction[] = [];
+function renderRoadActions() {
+  $("road-actions").innerHTML = roadActions.map((action, index) => {
+    const label = action.kind === "capacity" ? `${Math.round((action.multiplier ?? 1) * 100)}% capacity` : "close";
+    return `<div class="road-action"><span>${escapeHtml(roadLabel(roads[action.segment]))}</span><span>${label} at ${Math.round(action.startsAtS / 60)}m</span><button class="btn small" data-remove-action="${index}" aria-label="Remove action">×</button></div>`;
+  }).join("");
+  for (const button of $("road-actions").querySelectorAll<HTMLButtonElement>("[data-remove-action]")) {
+    button.onclick = async () => {
+      roadActions.splice(Number(button.dataset.removeAction), 1);
+      renderRoadActions();
+      await changeScenario();
+    };
+  }
+}
 const togglePlay = () => call({ cmd: snap.running ? "pause" : "play" });
-const resetRun = () => call({ cmd: "reset", rate: Number(rate.value), shadow: Number(shadow.value), warning });
+const resetRun = () => call({
+  cmd: "reset", rate: Number(rate.value), shadow: Number(shadow.value), warning, zones: zonePlans, roadActions,
+});
 const changeScenario = async () => { await resetRun(); refreshStats(); };
 $("play").onclick = togglePlay;
 $("reset").onclick = resetRun;
 
 rate.value = String(initial.demand.rate);
 shadow.value = String(initial.demand.shadow);
+function renderSchedule() {
+  const changed = zonePlans.filter((zone) => zone.orderTimeS > 0 || zone.participation !== Number(rate.value)).length;
+  $("schedule-summary").textContent = changed ? `${changed} town${changed === 1 ? "" : "s"} changed` : "All towns at once";
+  $("zone-schedule").innerHTML = zonePlans.map((zone) => `<div class="zone-row" data-town="${zone.town}">
+    <label title="${escapeHtml(townNames[zone.town])}">${escapeHtml(shortTown(zone.town))}</label>
+    <span class="field"><input data-field="order" type="number" min="0" max="180" step="5" value="${zone.orderTimeS / 60}" aria-label="${escapeHtml(shortTown(zone.town))} order time in minutes"><span class="unit">m</span></span>
+    <span class="field"><input data-field="participation" type="number" min="5" max="100" step="5" value="${zone.participation}" aria-label="${escapeHtml(shortTown(zone.town))} participation percentage"><span class="unit">%</span></span>
+  </div>`).join("");
+  for (const input of $("zone-schedule").querySelectorAll<HTMLInputElement>("input")) {
+    input.onchange = async () => {
+      const town = Number(input.closest<HTMLElement>(".zone-row")!.dataset.town);
+      const zone = zonePlans.find((candidate) => candidate.town === town)!;
+      const value = Number(input.value);
+      if (input.dataset.field === "order") zone.orderTimeS = Math.max(0, Math.min(180, value)) * 60;
+      else zone.participation = Math.max(5, Math.min(100, value));
+      renderSchedule();
+      await changeScenario();
+    };
+  }
+}
 const showSliders = () => {
   $("rate-val").textContent = `${rate.value}%`;
   $("shadow-val").textContent = `${shadow.value}%`;
 };
 showSliders();
 rate.oninput = shadow.oninput = showSliders;
-rate.onchange = shadow.onchange = changeScenario;
+rate.onchange = () => {
+  zonePlans.forEach((zone) => { zone.participation = Number(rate.value); });
+  renderSchedule();
+  changeScenario();
+};
+shadow.onchange = changeScenario;
+$("reset-schedule").onclick = () => {
+  zonePlans.forEach((zone) => { zone.orderTimeS = 0; zone.participation = Number(rate.value); });
+  renderSchedule();
+  changeScenario();
+};
+$("save-plan").onclick = () => {
+  if (!snap.done || !stats || stats.run !== snap.run) {
+    toast("error", "Finish the run before saving its result");
+    return;
+  }
+  const nameInput = $<HTMLInputElement>("plan-name");
+  const name = nameInput.value.trim() || `Plan ${savedPlans.length + 1}`;
+  savedPlans.push({
+    name, summary: stats.summary, rate: Number(rate.value), shadow: Number(shadow.value), warning,
+    zones: zonePlans.map((zone) => ({ ...zone })), roadActions: roadActions.map((action) => ({ ...action })),
+  });
+  localStorage.setItem("evacsim-plans", JSON.stringify(savedPlans));
+  nameInput.value = "";
+  renderSavedPlans();
+  toast("open", `Saved ${name}`);
+};
+$("export-plans").onclick = () => {
+  if (!savedPlans.length) {
+    toast("error", "Save at least one completed plan before exporting");
+    return;
+  }
+  const quote = (value: unknown) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+  const header = ["Plan", "90% out (min)", "Cleared (min)", "Stranded", "Mean delay (min)", "Total delay (veh-h)", "Scheduled closures"];
+  const rows = savedPlans.map((plan) => [plan.name, plan.summary.t90_min, plan.summary.cleared_min,
+    plan.summary.stranded, plan.summary.mean_delay_min, plan.summary.delay_veh_h, plan.summary.scheduled_closures]);
+  const blob = new Blob([[header, ...rows].map((row) => row.map(quote).join(",")).join("\n")], { type: "text/csv" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "evacuation-plans.csv";
+  link.click();
+  URL.revokeObjectURL(link.href);
+};
+$("print-plan").onclick = () => print();
+$("stagger-schedule").onclick = () => {
+  const ranked = [...zonePlans].sort((a, b) => network.demand.no_vehicle[b.town] - network.demand.no_vehicle[a.town]);
+  const tierSize = Math.ceil(ranked.length / 4);
+  ranked.forEach((zone, index) => { zone.orderTimeS = Math.floor(index / tierSize) * 15 * 60; });
+  renderSchedule();
+  changeScenario();
+};
 
 const warningSeg = $("warning");
 function renderWarning() {
@@ -847,6 +1017,8 @@ renderWarning();
 setMode("queues");
 setTab("overview");
 renderDemand(initial.demand);
+renderSchedule();
+renderRoadActions();
 await refreshStats();
 addEventListener("resize", () => { renderSpeed(snap.speed); renderWarning(); setMode(mode); setTab(activeTab); });
 

@@ -114,6 +114,7 @@
 
         <div class="tab-panel" data-panel="bottlenecks" hidden>
           <p class="lede">Roads ranked by the delay they cause. Queues spill back upstream, so delay is charged to the road at the front of the jam. Click one to inspect it.</p>
+          <p class="lede plan-hint">Schedule a closure to test whether the plan still works when a critical road becomes impassable.</p>
           <div class="list" id="bottlenecks"></div>
         </div>
 
@@ -139,6 +140,13 @@
             <tbody></tbody>
           </table>
           <div class="empty" id="compare-empty">Finish a run, then reset and run again to compare.</div>
+          <div class="saved-head">
+            <input id="plan-name" type="text" maxlength="40" placeholder="Plan name">
+            <button class="btn small" id="save-plan">Save result</button>
+            <button class="btn small" id="export-plans">Export CSV</button>
+            <button class="btn small" id="print-plan">Print</button>
+          </div>
+          <div id="saved-plans"></div>
         </div>
       </div>
     </section>
@@ -175,6 +183,17 @@
         </div>
       </div>
       <div class="slider-sub" id="rate-sub"></div>
+      <details class="schedule">
+        <summary>Evacuation schedule <span id="schedule-summary">All towns at once</span></summary>
+        <p class="schedule-note">Delay evacuation orders to keep neighboring towns from reaching the same bottleneck at once.</p>
+        <div class="schedule-head"><span>Town</span><span>Order</span><span>Leaving</span></div>
+        <div id="zone-schedule"></div>
+        <div class="schedule-presets">
+          <button class="btn small" id="stagger-schedule">Stagger by risk</button>
+          <button class="btn small" id="reset-schedule">Reset</button>
+        </div>
+      </details>
+      <div class="road-actions" id="road-actions"></div>
       <div class="row">
         <label for="shadow" title="Households within 200 m of a flood zone that leave even though they weren't told to">Neighbors leaving too</label>
         <div class="slider">
