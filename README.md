@@ -2,8 +2,6 @@
 
 ## Deploying on Dokploy
 
-Create an Application in Dokploy and set **Build Type** to **Dockerfile**. Add a named volume mounted at `/app/data`, then configure a domain to the container port `5050` with HTTPS enabled.
+Create an Application in Dokploy and set **Build Type** to **Dockerfile**, then configure a domain to the container port `5050` with HTTPS enabled.
 
-The first boot takes several minutes while `prepare.py` downloads and generates the simulation data. Expect a `502` response until preparation finishes. The container needs about 2 GB of RAM.
-
-Run exactly **one replica**. The simulation state is a global shared by all visitors, so multiple replicas would give visitors different worlds.
+The image builds the Vite frontend and serves it with nginx. The simulation runs in the browser from the data committed in `public/data`, so there is no server state, volume, or replica limit. To regenerate that data, run `python prepare.py` locally and commit the result.
