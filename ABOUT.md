@@ -4,9 +4,9 @@
 
 ## What it is
 
-evacsim is a live, interactive map that shows what happens when everyone living in NJ-12's flood zones tries to drive out at once. You press Run and watch thousands of cars leave their homes, fill the roads, back up at bottlenecks, and reach dry ground (or fail to).
+evacsim is an interactive model of cars leaving NJ-12's mapped flood zones. You press Run and watch simulated traffic move through the road network, queue at bottlenecks, and reach modeled exits or become stranded.
 
-It doesn't just show the problem. It lets you build an evacuation plan, test it, and compare it against other plans to see which one gets people out fastest.
+It lets you build scenarios and compare their modeled travel times, queue delays, and stranded cars. It has not been calibrated against an observed evacuation and is not an operational forecast. The app's [methodology page](public/methodology.html) explains the assumptions, sources, and limitations.
 
 It covers 32 towns, including Trenton, Princeton, Ewing, Plainfield, Bound Brook, Manville, East Brunswick and Franklin. It uses real data: the actual road network, FEMA's official flood maps, and Census counts of who lives where and who owns a car.
 
@@ -31,16 +31,17 @@ The simulator handles three levels of warning:
 
 ## Why it exists
 
-During a flood, roads become the problem. Bridges go under water, low streets close, and everyone heads for the same few highways. A plan that looks fine on paper can turn into hours-long gridlock.
+Road closures and competing traffic can change which evacuation routes remain available. evacsim explores these effects under explicit assumptions about departures and road capacity. Its default scenario does not show hours-long gridlock.
 
-Evacuation plans are usually written as documents and rarely tested. evacsim turns them into something you can run and watch, so the weak spots show up on a screen first instead of during the next storm.
+The aim is to make those assumptions and tradeoffs visible so people can ask better questions about a plan before a storm.
 
 ## What you can do with it
 
 - **Watch an evacuation play out** and see how long it takes to get everyone out, which roads jam first, and which towns get stuck the longest.
-- **Close roads and bridges**, either right away or at a set time (like "this bridge floods 30 minutes in"), to check whether the plan still works when a key route is lost. Roads can also be narrowed or widened, like a lane closure or extra lanes opened by police.
+- **Close roads and bridge segments**, either right away or at a set time, to test hypothetical route losses. The crossing preset selects bridges intersecting mapped flood zones; it does not establish that their decks flood. Road discharge capacity can also be changed.
 - **Schedule evacuation orders town by town** instead of telling everyone to leave at once, so neighboring towns don't all hit the same bottleneck together.
-- **Stagger by risk** with one click: towns with the most households without cars are told to leave first, and the rest follow in waves.
+- **Stagger towns** with one click: towns with the most households without cars receive orders first, and the rest follow in waves. Their assisted transport is not modeled, and staggering is not guaranteed to improve outcomes.
+- **Follow a guided experiment** comparing open roads, hypothetical crossing closures after 30 minutes, and staggered orders. All three results are calculated in the browser; the comparison shows tradeoffs rather than assuming one plan wins.
 - **Change who leaves**: how many people in each town actually follow the order, and how many neighbors outside the flood zone leave too.
 - **Save and compare plans** side by side (time to get 90% of people out, total delay, people stranded), then export the results as a spreadsheet or print them.
 
@@ -52,4 +53,4 @@ Evacuation plans are usually written as documents and rarely tested. evacsim tur
 
 ## The point
 
-Floods in New Jersey are getting worse and more frequent. evacsim gives the people in charge a way to try out a plan before a storm instead of during one, and to prove with numbers which plan works best.
+evacsim provides an accessible way to explore evacuation scenarios. Its results are starting points for discussion and further validation, not proof that a plan will work in a real flood.

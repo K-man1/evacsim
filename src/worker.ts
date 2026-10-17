@@ -6,9 +6,11 @@ import type { Warning } from "./sim.ts";
 export type Command =
   | { cmd: "state" }
   | { cmd: "stats" }
+  | { cmd: "experience"; view: "tour" | "explore" }
   | { cmd: "close" | "open"; segs: number[] }
   | { cmd: "closeFloodedBridges" | "openAll" | "play" | "pause" }
   | { cmd: "speed"; steps: number }
+  | { cmd: "example"; stage: 0 | 1 | 2 }
   | { cmd: "reset"; rate?: number; shadow?: number; warning?: Warning; zones?: ZonePlan[]; roadActions?: RoadAction[] };
 
 export type FromWorker =
@@ -19,7 +21,8 @@ const [meta, bin] = await Promise.all([
   fetch("/data/network.json").then((r) => r.json() as Promise<NetworkJson>),
   fetch("/data/network.bin").then((r) => r.arrayBuffer()),
 ]);
-const world = new World(meta, bin);
+let world = new World(meta, bin);
+const worlds = { tour: world, explore: null as World | null };
 
 const send = (msg: FromWorker) => postMessage(msg);
 const publish = () => send({ type: "snapshot", snapshot: world.snapshot() });
@@ -33,12 +36,17 @@ function handle(c: Command): unknown {
   }
   const result = mutate(c);
   world.publish();
-  publish();
+  if (c.cmd !== "experience") publish();
   return result ?? { ok: true };
 }
 
 function mutate(c: Exclude<Command, { cmd: "state" | "stats" }>) {
   switch (c.cmd) {
+    case "experience":
+      world.running = false;
+      worlds[c.view] ??= new World(meta, bin);
+      world = worlds[c.view]!;
+      return { state: world.state(), roadActions: world.roadActions };
     case "close":
     case "open":
       return world.setSegments(c.segs, c.cmd === "close");
@@ -56,6 +64,8 @@ function mutate(c: Exclude<Command, { cmd: "state" | "stats" }>) {
       return;
     case "reset":
       return world.reset(c.rate, c.shadow, c.warning, c.zones, c.roadActions);
+    case "example":
+      return world.loadExample(c.stage);
   }
 }
 

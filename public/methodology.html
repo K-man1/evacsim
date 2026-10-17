@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Data sources, assumptions, and limitations of the evacsim NJ-12 evacuation model.">
+  <title>Methodology &amp; limitations · evacsim</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.65 system-ui, sans-serif; color: #ededed; background: #0a0a0a; }
+    body { max-width: 780px; margin: auto; padding: 32px 24px 80px; }
+    a { color: #a8cef7; text-underline-offset: 3px; }
+    a:focus-visible { outline: 2px solid currentColor; outline-offset: 4px; }
+    h1 { font-size: clamp(28px, 6vw, 42px); line-height: 1.15; letter-spacing: -0.035em; margin-bottom: 18px; }
+    h2 { margin: 40px 0 12px; font-size: 23px; line-height: 1.3; }
+    h3 { font-size: 17px; margin-bottom: 6px; }
+    p, li, dd { color: #bababa; }
+    li { margin: 8px 0; }
+    strong, dt { color: #ededed; }
+    dt { margin-top: 18px; font-weight: 600; }
+    dd { margin: 4px 0; }
+    .notice { border-left: 3px solid #f07a3c; padding: 12px 18px; background: #17120f; }
+    .notice p { margin: 0; }
+    .meta { font-size: 13px; color: #a1a1a1; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 24px 0; }
+    code { font-size: 0.9em; overflow-wrap: anywhere; }
+    @media print { :root { color-scheme: light; color: #111; background: white; } p, li, dd, .meta { color: #333; } strong, dt { color: #111; } a { color: #174779; } .notice { background: none; } }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="/">Back to the simulator</a>
+    <h1>What the model can tell you.</h1>
+    <p>evacsim explores how road closures, departure timing, and extra traffic affect simulated evacuations in New Jersey’s 12th Congressional District.</p>
+    <div class="notice"><p><strong>An exploratory planning model.</strong> Outputs have not been calibrated or validated against an observed NJ-12 evacuation. They are conditional on the assumptions below, not forecasts of a storm or instructions for an actual evacuation. Follow local emergency authorities during an emergency.</p></div>
+    <nav aria-label="On this page">
+      <a href="#sources">Data sources</a><a href="#demand">Households</a><a href="#traffic">Traffic</a>
+      <a href="#exits">Modeled exits</a><a href="#bridges">Bridge closures</a><a href="#experiment">Guided experiment</a><a href="#limits">Limits &amp; testing</a>
+    </nav>
+  </header>
+  <main>
+    <section id="sources">
+      <h2>Data sources and dates</h2>
+      <p>The shipped dataset was committed on October 12, 2026. Individual download timestamps for the road and flood extracts were not recorded. Neither extract is a live feed; the commit date is not a source publication or map-effective date.</p>
+      <dl>
+        <dt>District and municipalities · 2023 TIGER/Line</dt>
+        <dd><a href="https://www2.census.gov/geo/tiger/TIGER2023/CD/tl_2023_34_cd118.zip">118th Congressional District boundaries</a> and <a href="https://www2.census.gov/geo/tiger/TIGER2023/COUSUB/tl_2023_34_cousub.zip">New Jersey county subdivisions</a>. Town polygons are clipped to NJ-12; boundary slivers smaller than 2% of a town’s area are excluded.</dd>
+        <dt>Population and housing units · 2020 Census</dt>
+        <dd><a href="https://www2.census.gov/geo/tiger/TIGER2020/TABBLOCK20/tl_2020_34_tabblock20.zip">New Jersey tabulation blocks</a>, using their population and housing-unit counts.</dd>
+        <dt>Households and vehicle availability · ACS 2018–2022</dt>
+        <dd><a href="https://www2.census.gov/programs-surveys/acs/summary_file/2022/table-based-SF/data/5YRData/acsdt5y2022-b25044.dat">Five-year table B25044</a>, at block-group level. Owner and renter households with no vehicle are combined. ACS sampling uncertainty is not propagated into the results.</dd>
+        <dt>Flood zones · FEMA National Flood Hazard Layer</dt>
+        <dd><a href="https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28">Flood hazard polygons</a> marked as Special Flood Hazard Areas, clipped to the district and generalized for display. These are mapped hazard areas, not a particular storm’s flood extent, water depth, or arrival time. Polygon-effective dates were not retained in the extract.</dd>
+        <dt>Roads · OpenStreetMap</dt>
+        <dd>The drivable network within NJ-12 plus a 1 km buffer, downloaded with OSMnx. OSM road classes, directions, lanes, and bridge tags supply network attributes. OSMnx estimates missing speeds. Missing lane counts use defaults. <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors and data license</a>.</dd>
+        <dt>Background map · Esri</dt>
+        <dd><a href="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer">Dark Gray Canvas</a> and its reference labels provide visual context. They do not determine traffic or flood results.</dd>
+      </dl>
+    </section>
+    <section id="demand">
+      <h2>From Census counts to simulated cars</h2>
+      <p>ACS households are distributed across each block group’s Census blocks in proportion to 2020 housing units. Within each block, the fraction of land area intersecting the floodplain is used as the fraction of residents and households exposed. This assumes people are spread uniformly within a block, which can overestimate or underestimate exposure.</p>
+      <p>Each participating household with a vehicle contributes one car. Households without vehicles are shown separately and excluded from traffic. The estimated people without a vehicle use the block-group household rate, not observed individual vehicle access. “100% out” means all participating flood-zone cars reached a modeled exit; it does not include nonparticipating households or people without cars.</p>
+      <p>Cars start at usable intersections inside each demand area, weighted by outgoing residential street length. Areas without an eligible intersection use the nearest usable intersection. Usable origins exclude modeled exits and nodes disconnected from all exits even with every road open, so disconnected source locations can be relocated.</p>
+      <p>Neighbor demand uses the dry portion of blocks whose representative point is within 200 m of a flood zone. This is a block-based approximation, not an exact count of houses within 200 m. The default scenario includes 20% of these vehicle-owning households.</p>
+    </section>
+    <section id="traffic">
+      <h2>Departures, queues, and routing</h2>
+      <p>The simulation advances in five-second steps. A car must spend at least the road’s free-flow travel time before leaving it. Road discharge is limited by lane capacity; a full downstream road blocks cars upstream. Storage assumes 7.5 m per car per lane.</p>
+      <p>Assumed saturation flows, in vehicles per hour per lane: motorway 2,000; trunk and primary 1,800; secondary 1,500; tertiary 1,200; residential and unclassified 900; living street 600. Missing lane counts default to two per direction on motorways and trunks, and one elsewhere. These are model parameters, not measurements of local traffic.</p>
+      <p>Routes minimize estimated travel time to the nearest modeled exit. Routing updates every 120 simulated seconds using road occupancy and downstream queues. Waiting cars adopt the new plan; each moving car has a 30% chance of adopting it. A blocked plan triggers a fallback to the current route. A fixed random seed makes identical scenarios repeatable.</p>
+      <p>Departure times follow a Rayleigh-shaped curve. Sudden, Hours, and A day set departure peaks at 10, 25, and 75 minutes; roughly 95% of intended departures occur by 25, 61, and 184 minutes. These illustrative settings are not fitted to local warning-response data. Town order times shift flood-zone departures later; neighbor departures remain unchanged. There is no separate flood-arrival deadline.</p>
+      <p>Average delay per car measures completed flood-zone trips relative to free flow with all roads open. Total delay counts queue waiting across all cars and attributes it to the downstream bottleneck, so it is a different measure and includes neighbors. Neither measure includes the time a household intentionally waits before its scheduled departure.</p>
+    </section>
+    <section id="exits">
+      <h2>What counts as an exit?</h2>
+      <p>A car is marked evacuated when it reaches a node on a motorway, trunk, or primary road, or outside the district, beyond the flood-zone buffer. That buffer is 0.002 geographic degrees, approximately 170–220 m in NJ depending on direction, not a uniform 200 m distance.</p>
+      <p>The car then leaves the model. These nodes are not verified shelters or destinations with capacity limits. Further travel, congestion beyond the exit, and shelter access are not modeled. This can substantially shorten reported trips and omit downstream bottlenecks.</p>
+      <p>Stranded means no modeled route remains from the car’s location when the simulator checks it. It is a terminal state for that run; reopening roads does not rescue already-stranded cars. “Last one out” is the last successful arrival and can appear even when other cars remain stranded.</p>
+    </section>
+    <section id="bridges">
+      <h2>Bridge crossings are not confirmed flooded bridges</h2>
+      <p>The crossing toggle selects mapped road segments tagged as bridges whose geometry intersects a FEMA flood zone. An intersection in a flat map does not establish that a bridge deck floods. No deck elevation, water depth, structural vulnerability, gauge threshold, or official closure record is used.</p>
+      <p>Counts refer to road segments, not unique physical bridges. Closing these segments is a hypothetical stress test. A closure prevents new entries and triggers rerouting; cars already on the segment can continue to its end. The model does not simulate vehicles swept away or water moving across roads.</p>
+    </section>
+    <section id="experiment">
+      <h2>The guided comparison</h2>
+      <ol>
+        <li><strong>Open roads:</strong> all town orders at minute zero, 100% flood-zone vehicle-household participation, 20% neighbor participation, and the Hours departure curve.</li>
+        <li><strong>Crossing closures:</strong> identical demand, with all selected bridge segments closing at minute 30. This extreme network stress test is not an Ida reconstruction.</li>
+        <li><strong>Staggered orders:</strong> identical demand and closures, with towns ranked by estimated households without vehicles and split into four groups. Orders occur at 0, 15, 30, and 45 minutes. This simple heuristic does not model buses or optimize a schedule.</li>
+      </ol>
+      <p>Every result is computed in the browser. The comparison reports both queue delay and stranded cars because delaying orders can reduce queues while leaving more cars unable to depart before a crossing closes. It does not assume that staggering wins.</p>
+    </section>
+    <section id="limits">
+      <h2>Testing and remaining limits</h2>
+      <p>Automated tests check vehicle conservation, road capacity, spillback, closures, rerouting, departure curves, and travel times on small constructed networks. The guided example is also checked on the shipped NJ-12 network for completion, consistent demand, and repeatability. These checks establish implementation behavior, not real-world predictive accuracy.</p>
+      <p>The model omits traffic lights and intersection control, background traffic beyond the selected neighbor demand, emergency vehicles, walking, buses, shelter limits, rainfall, flood depth, and evolving flood extent. Lane and speed defaults, dated population inputs, uncertain household locations, and the simplified exit definition all influence results. No confidence intervals are estimated.</p>
+      <p>Before operational use, this would need review by local emergency and transportation professionals, measured capacities and departure behavior, verified closure scenarios and destinations, sensitivity analysis, and comparison with observed evacuation data.</p>
+      <p class="meta">Implementation: <a href="https://github.com/K-man1/evacsim/blob/main/prepare.py">data preparation</a>, <a href="https://github.com/K-man1/evacsim/blob/main/src/sim.ts">traffic simulation</a>, and <a href="https://github.com/K-man1/evacsim/blob/main/src/world.ts">scenario and metric definitions</a>.</p>
+    </section>
+  </main>
+</body>
+</html>

@@ -9,217 +9,116 @@
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/src/style.css">
 </head>
-<body>
+<body data-view="tour" data-started="false">
+  <dialog class="welcome card" id="welcome" aria-labelledby="welcome-title" aria-describedby="welcome-description">
+    <p class="eyebrow">Welcome to evacsim</p>
+    <h2 id="welcome-title">What happens when everyone needs to leave?</h2>
+    <p id="welcome-description">Simulate a flood evacuation on real roads in New Jersey’s 12th district. See how traffic, closed crossings, and the timing of evacuation orders affect who gets out.</p>
+    <p>Follow three experiments in the guided tour, or build your own scenario in Explore. You can switch modes without losing your tour progress.</p>
+    <p class="micro">Real road and Census data. Hypothetical scenarios, not a flood forecast.</p>
+    <button class="btn primary" id="welcome-start" autofocus>Get started</button>
+  </dialog>
   <div id="map"></div>
   <canvas id="sparks"></canvas>
-
-  <header class="topbar card" style="--i:0">
-    <div class="mark" aria-hidden="true">
-      <svg viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M2 11c2-2 4-2 6 0s4 2 6 0M8 2v6m0 0L5.5 5.5M8 8l2.5-2.5"/>
-      </svg>
-    </div>
-    <div class="brand">
-      <h1 class="shiny">evacsim</h1>
-      <p>NJ-12 · FEMA 100-year floodplain</p>
-    </div>
-    <div class="divider"></div>
-    <span class="pill" id="status" data-state="paused"><span class="dot"></span><span id="status-text">Ready</span></span>
+  <header class="topbar card">
+    <div class="brand"><h1>evacsim</h1><p>Flood evacuation · New Jersey’s 12th district</p></div>
+    <nav class="experience" aria-label="Choose your experience">
+      <button id="view-tour" aria-pressed="true">Guided tour</button>
+      <button id="view-explore" aria-pressed="false">Explore</button>
+    </nav>
   </header>
-
-  <nav class="modes card" style="--i:1" aria-label="Map layer">
-    <div class="seg" id="modes">
-      <span class="thumb"></span>
-      <button data-mode="queues" aria-pressed="true">Live queues</button>
-      <button data-mode="delay" aria-pressed="false">Delay caused</button>
-      <button data-mode="routes" aria-pressed="false">Planned routes</button>
-    </div>
+  <nav class="modes card explore-only" aria-label="Map layer">
+    <div class="seg" id="modes"><span class="thumb"></span><button data-mode="queues" aria-pressed="true">Traffic now</button><button data-mode="delay" aria-pressed="false">Delay hotspots</button><button data-mode="routes" aria-pressed="false">Routes ahead</button></div>
   </nav>
-
-  <aside class="panel" id="panel">
-    <section class="card" style="--i:2">
-      <p class="eyebrow">Simulation clock</p>
-      <div class="clock">
-        <time id="clock">00:00:00</time>
-        <span class="pct" id="pct">0% out</span>
-      </div>
+  <aside class="panel" id="panel" aria-label="Evacuation experiment">
+    <section class="card clock-card">
+      <div class="clock-heading"><p class="eyebrow">Time since first order</p><span class="pill" id="status" data-state="paused"><span class="dot"></span><span id="status-text">Ready</span></span></div>
+      <div class="clock"><time id="clock">00:00:00</time><span class="pct" id="pct">0% of cars out</span></div>
       <div class="progress"><span id="progress"></span></div>
-      <div class="result" id="result"><div id="result-text"></div></div>
+      <p class="micro">“Out” means a participating flood-zone car reached a modeled exit.</p>
+      <div class="result explore-only" id="result"><div id="result-text"></div></div>
       <div class="controls">
-        <button class="btn primary grow" id="play">
-          <svg id="play-icon" viewBox="0 0 16 16" fill="currentColor"><path d="M4 2.8v10.4a.6.6 0 0 0 .9.5l8.4-5.2a.6.6 0 0 0 0-1L4.9 2.3a.6.6 0 0 0-.9.5z"/></svg>
-          <span id="play-label">Run</span> <kbd>Space</kbd>
-        </button>
-        <button class="btn" id="reset" title="Reset run (R)">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2.5 8a5.5 5.5 0 1 0 1.7-4M2.5 2.5V5H5"/></svg>
-          Reset
-        </button>
+        <button class="btn primary grow" id="play"><svg id="play-icon" viewBox="0 0 16 16" fill="currentColor"><path d="M4 2.8v10.4a.6.6 0 0 0 .9.5l8.4-5.2a.6.6 0 0 0 0-1L4.9 2.3a.6.6 0 0 0-.9.5z"/></svg><span id="play-label">Run</span></button>
+        <button class="btn explore-only" id="reset" title="Restart the clock, keeping your scenario">Reset run</button>
       </div>
-      <div class="row">
-        <label>Speed</label>
-        <div class="seg" id="speed" role="group" aria-label="Simulation speed"><span class="thumb"></span></div>
-      </div>
+      <details class="playback explore-only"><summary>Playback speed <span>Changes viewing speed only</span></summary><div class="seg" id="speed" role="group" aria-label="Simulation speed"><span class="thumb"></span></div></details>
     </section>
-
-    <section class="card tabs-card" style="--i:3">
-      <div class="tabbar" role="tablist" id="tabbar">
-        <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
-        <button role="tab" data-tab="bottlenecks" aria-selected="false">Bottlenecks</button>
+    <section class="card tabs-card">
+      <div class="tabbar explore-only" role="tablist" id="tabbar">
+        <button role="tab" data-tab="overview" aria-selected="true">Results</button>
+        <button role="tab" data-tab="bottlenecks" aria-selected="false">Traffic jams</button>
         <button role="tab" data-tab="towns" aria-selected="false">Towns</button>
-        <button role="tab" data-tab="compare" aria-selected="false">Compare<span class="badge" id="compare-badge" hidden>vs prev</span></button>
-        <span class="underline"></span>
+        <button role="tab" data-tab="compare" aria-selected="false">Compare<span class="badge" id="compare-badge" hidden>vs prev</span></button><span class="underline"></span>
       </div>
       <div class="tab-body">
-        <div class="tab-panel" data-panel="overview">
-          <p class="eyebrow">Living in the flood zone <span class="source">2020 Census · ACS 2022</span></p>
-          <dl class="tiles">
-            <div class="tile"><dt>People</dt><dd id="d-people">—</dd></div>
-            <div class="tile"><dt>Households</dt><dd id="d-households">—</dd></div>
-            <div class="tile"><dt>Their cars</dt><dd id="d-cars">—</dd></div>
-            <div class="tile need"><dt>No vehicle</dt><dd id="d-novehicle">—</dd></div>
-          </dl>
-          <p class="note" id="d-note"></p>
-          <p class="eyebrow section-head">This run, all cars including neighbors</p>
-          <dl class="tiles">
-            <div class="tile"><dt>Evacuated</dt><dd id="n-evacuated">0</dd></div>
-            <div class="tile"><dt>On the road</dt><dd id="n-on_road">0</dd></div>
-            <div class="tile"><dt>Not yet left</dt><dd id="n-waiting">0</dd></div>
-            <div class="tile" id="stranded-tile">
-              <dt><svg class="icon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.5 15 14H1L8 1.5zm-.75 4.5v4h1.5V6h-1.5zm0 5v1.5h1.5V11h-1.5z"/></svg>Stranded</dt>
-              <dd id="n-stranded">0</dd>
-            </div>
-          </dl>
-          <div class="section">
-            <p class="eyebrow">Flood-zone residents</p>
-            <dl class="tiles">
-              <div class="tile"><dt>90% out by</dt><dd id="m-t90">—</dd></div>
-              <div class="tile"><dt>Last one out</dt><dd id="m-last">—</dd></div>
-              <div class="tile"><dt>Median trip</dt><dd id="m-median">—</dd></div>
-              <div class="tile"><dt>Avg delay per car</dt><dd id="m-delay">—</dd></div>
-              <div class="tile"><dt>Stranded</dt><dd id="m-stranded">—</dd></div>
-              <div class="tile"><dt>Total delay, all cars</dt><dd id="m-vh">—</dd></div>
-            </dl>
+        <section class="guide" aria-labelledby="guide-title">
+          <p class="eyebrow" id="guide-kicker">Three quick experiments</p>
+          <h2 id="guide-title">Can everyone get out before roads close?</h2>
+          <p id="guide-description">Try three evacuation plans on real New Jersey roads. See how a small change can leave more cars without a way out.</p>
+          <ol class="tour-steps" aria-label="Tour steps"><li>Open roads</li><li>Close crossings</li><li>Stagger orders</li></ol>
+          <dl class="guide-setup" id="guide-setup" hidden></dl>
+          <p class="watch-note" id="guide-observe" hidden></p>
+          <div id="guide-results" aria-live="polite"></div>
+          <div class="guide-controls"><button class="btn primary" id="guide-next">Start with open roads</button><button class="btn" id="guide-exit" hidden>Explore your own plan</button></div>
+          <div id="guide-intro"><div class="local-context"><strong id="tour-people">—</strong><span>people estimated to live in mapped flood zones here.</span></div><p class="micro">One car per participating household with a vehicle. People without cars need transport this model does not simulate.</p></div>
+          <p class="micro" id="guide-footnote">Real road and Census data. Hypothetical closures. This is an experiment, not a flood forecast.</p>
+        </section>
+        <div class="tab-panel explore-only" data-panel="overview">
+          <div class="dock" id="dock">
+            <h2 class="panel-title">Your scenario</h2><p class="lede">Change one thing, run it, then compare. Changing a setting restarts the clock.</p>
+            <details class="scenario-group"><summary>Who leaves? <span id="people-setting">All households with cars</span></summary>
+              <div class="row"><label for="rate">Flood-zone households</label><div class="slider"><input type="range" id="rate" min="5" max="100" step="5"><span class="cars-val" id="rate-val"></span></div></div>
+              <p class="micro">The share of vehicle-owning households that follow the order.</p><div class="slider-sub" id="rate-sub"></div>
+              <div class="row"><label for="shadow">Neighbors joining them</label><div class="slider"><input type="range" id="shadow" min="0" max="100" step="5"><span class="cars-val" id="shadow-val"></span></div></div>
+              <p class="micro">People outside the flood zone can leave too, adding traffic to the same roads.</p><div class="slider-sub" id="shadow-sub"></div>
+            </details>
+            <details class="scenario-group"><summary>When do they leave? <span id="departure-setting">About an hour to depart</span></summary>
+              <p class="micro">Warning time sets how quickly households prepare to leave after their town’s order.</p>
+              <div class="seg" id="warning" role="group" aria-label="Warning time"><span class="thumb"></span><button data-warning="sudden">Sudden</button><button data-warning="short">Hours</button><button data-warning="long">A day</button></div><p class="micro" id="warning-explanation"></p>
+              <details class="schedule"><summary>Town-by-town orders <span id="schedule-summary">All towns at once</span></summary><p class="micro">Order is minutes after the clock starts. Leaving is the percentage of that town’s vehicle-owning households.</p>
+                <div class="schedule-head"><span>Town</span><span>Order</span><span>Leaving</span></div><div id="zone-schedule"></div>
+                <div class="schedule-presets"><button class="btn small" id="stagger-schedule">Spread into four waves</button><button class="btn small" id="reset-schedule">All at once</button></div><p class="micro">Waves are 15 minutes apart. Towns with more households without cars go first, but assisted transport is not simulated.</p>
+              </details>
+            </details>
+            <details class="scenario-group"><summary>Which roads close? <span id="road-setting">All roads open</span></summary><p class="micro">Click a road on the map to close or reopen it. Closed roads force cars to find another route.</p>
+              <button class="btn bridge-btn" id="close-bridges" data-state="idle"><span class="label"><span id="bridge-title">Close flood-zone crossings</span><span class="sub" id="bridge-sub">Hypothetical bridge-segment closures</span></span></button><p class="micro">These bridges cross mapped flood zones. That does not mean their decks flood.</p>
+              <div class="row"><span class="closed-count" id="closed-count">0 roads closed</span><button class="btn small" id="open-all">Reopen all</button></div><div class="road-actions" id="road-actions"></div><p class="micro">For a timed closure or capacity change, open a road in the Traffic jams tab.</p>
+            </details>
           </div>
-          <div class="section">
-            <div class="chart-head">
-              <p class="eyebrow">Flood-zone residents out</p>
-              <div class="legend"><span><i></i>This run</span><span id="legend-prev" hidden><i class="prev"></i>Previous</span></div>
-            </div>
-            <div class="chart-wrap">
-              <svg id="chart" role="img" aria-label="Percent of flood-zone residents evacuated over simulated time"></svg>
-              <div class="chart-tip" id="chart-tip"></div>
-            </div>
-          </div>
+          <section class="outcomes">
+            <h2 class="panel-title">Did the plan work?</h2><p class="lede" id="outcome-hint">Run the simulation to see the outcome for participating flood-zone cars.</p>
+            <dl class="tiles outcome-tiles"><div class="tile"><dt>90% out by</dt><dd id="m-t90">—</dd><p>Time since the first order.</p></div><div class="tile"><dt>Cars without a route</dt><dd id="m-stranded">—</dd><p>Could not reach a modeled exit.</p></div></dl>
+            <details class="explanation"><summary>What counts as “out”?</summary><p>A car reaches a major road or leaves the district beyond the flood-zone buffer. This is not a verified shelter. People without cars and nonparticipating households are not included in the percentage.</p></details>
+            <details class="explanation"><summary>Trip times and traffic delay</summary><dl class="tiles"><div class="tile"><dt>Last successful arrival</dt><dd id="m-last">—</dd><p>Others may still be stranded.</p></div><div class="tile"><dt>Typical trip</dt><dd id="m-median">—</dd><p>Half of completed trips are shorter.</p></div><div class="tile"><dt>Extra time per car</dt><dd id="m-delay">—</dd><p>Compared with open, empty roads.</p></div><div class="tile"><dt>Combined queue delay</dt><dd id="m-vh">—</dd><p>All cars, including neighbors.</p></div></dl><p>One vehicle-hour means one car waiting an hour, or 60 cars each waiting a minute. Scheduled time before departure is not counted as delay.</p></details>
+            <details class="explanation"><summary>Where are the cars now?</summary><p>These counts include flood-zone cars and neighbors.</p><dl class="tiles"><div class="tile"><dt>Reached an exit</dt><dd id="n-evacuated">0</dd></div><div class="tile"><dt>On the road</dt><dd id="n-on_road">0</dd></div><div class="tile"><dt>Not yet left</dt><dd id="n-waiting">0</dd></div><div class="tile" id="stranded-tile"><dt>No route</dt><dd id="n-stranded">0</dd></div></dl></details>
+            <details class="explanation" id="chart-details"><summary>See progress over time</summary><p>The line rises as flood-zone cars reach exits. A flatter line means slower progress.</p><div class="chart-head"><span>Share of participating cars out</span><div class="legend"><span><i></i>This run</span><span id="legend-prev" hidden><i class="prev"></i>Previous</span></div></div><div class="chart-wrap"><svg id="chart" role="img" aria-label="Share of participating flood-zone cars reaching a modeled exit over time"></svg><div class="chart-tip" id="chart-tip"></div></div></details>
+          </section>
+          <details class="explanation"><summary>Who is represented?</summary><p>Estimates from the 2020 Census and 2018–2022 ACS, allocated to mapped flood zones.</p><dl class="tiles"><div class="tile"><dt>Residents</dt><dd id="d-people">—</dd></div><div class="tile"><dt>Households</dt><dd id="d-households">—</dd></div><div class="tile"><dt>Flood-zone cars in this run</dt><dd id="d-cars">—</dd></div><div class="tile"><dt>Households without a car</dt><dd id="d-novehicle">—</dd></div></dl><p id="d-note"></p></details>
         </div>
-
-        <div class="tab-panel" data-panel="bottlenecks" hidden>
-          <p class="lede">Roads ranked by the delay they cause. Queues spill back upstream, so delay is charged to the road at the front of the jam. Click one to inspect it.</p>
-          <p class="lede plan-hint">Schedule a closure to test whether the plan still works when a critical road becomes impassable.</p>
-          <div class="list" id="bottlenecks"></div>
+        <div class="tab-panel explore-only" data-panel="bottlenecks" hidden>
+          <h2 class="panel-title">Where does traffic get stuck?</h2><p class="lede">Roads with the most combined waiting time come first. Select a road to find it on the map.</p>
+          <details class="explanation"><summary>How to read this list</summary><p>Queued means cars on the road now. Routed means cars whose remaining route uses it. Both fall to zero when a run ends. Delay keeps the record of the jam.</p><p>When a queue backs into another street, delay is assigned to the road at the front of the jam. One vehicle-hour is 60 car-minutes of waiting.</p></details><div class="list" id="bottlenecks"></div>
         </div>
-
-        <div class="tab-panel" data-panel="towns" hidden>
-          <p class="lede">Municipalities with residents in the flood zone. "No car" counts households with no vehicle, who need another way out. Click a row to zoom to it.</p>
-          <table id="towns">
-            <thead><tr>
-              <th><button data-sort="name">Town</button></th>
-              <th class="r"><button data-sort="cars">Cars</button></th>
-              <th class="r"><button data-sort="pct">Out</button></th>
-              <th class="r"><button data-sort="cleared">Cleared</button></th>
-              <th class="r"><button data-sort="stranded">Stranded</button></th>
-              <th class="r"><button data-sort="novehicle" title="Households with no vehicle">No car</button></th>
-            </tr></thead>
-            <tbody></tbody>
-          </table>
+        <div class="tab-panel explore-only" data-panel="towns" hidden>
+          <h2 class="panel-title">Which towns need attention?</h2><p class="lede">Select a town to zoom in. Select a column heading to sort.</p>
+          <details class="explanation"><summary>What the columns mean</summary><p>Cars: participating flood-zone vehicles. Out: share that reached an exit. Last: last successful arrival, even if others were stranded. No route: cars unable to get out. No car: households needing other transport, not simulated here.</p></details>
+          <div class="table-scroll"><table id="towns"><thead><tr><th><button data-sort="name">Town</button></th><th class="r"><button data-sort="cars">Cars</button></th><th class="r"><button data-sort="pct">Out</button></th><th class="r"><button data-sort="cleared">Last</button></th><th class="r"><button data-sort="stranded">No route</button></th><th class="r"><button data-sort="novehicle">No car</button></th></tr></thead><tbody></tbody></table></div>
         </div>
-
-        <div class="tab-panel" data-panel="compare" hidden>
-          <p class="lede">This run against the one before it. Change roads, reset, and run again to test a decision.</p>
-          <table class="compare" id="compare">
-            <thead><tr><th>Metric</th><th class="r">This run</th><th class="r">Previous</th><th class="r">Change</th></tr></thead>
-            <tbody></tbody>
-          </table>
-          <div class="empty" id="compare-empty">Finish a run, then reset and run again to compare.</div>
-          <div class="saved-head">
-            <input id="plan-name" type="text" maxlength="40" placeholder="Plan name">
-            <button class="btn small" id="save-plan">Save result</button>
-            <button class="btn small" id="export-plans">Export CSV</button>
-            <button class="btn small" id="print-plan">Print</button>
-          </div>
-          <div id="saved-plans"></div>
+        <div class="tab-panel explore-only" data-panel="compare" hidden>
+          <h2 class="panel-title">Did your change help?</h2><p class="lede">Finish a run. Change one setting and run again. Compare how many cars got out and how long it took.</p>
+          <details class="explanation" open><summary>This run vs. the previous run</summary><div class="table-scroll"><table class="compare" id="compare"><thead><tr><th>Metric</th><th class="r">Now</th><th class="r">Before</th><th class="r">Change</th></tr></thead><tbody></tbody></table></div><button class="btn small" id="compare-details" aria-expanded="false" aria-controls="compare" hidden>Show all metrics and settings</button><div class="empty" id="compare-empty">Your first comparison will appear after you start a second run.</div></details>
+          <h3>Keep a result</h3><p class="micro">Saved in this browser. Export a spreadsheet to keep a copy.</p><div class="saved-head"><input id="plan-name" aria-label="Result name" type="text" maxlength="40" placeholder="Name this result"><button class="btn small" id="save-plan">Save result</button><button class="btn small" id="export-plans">Export CSV</button><button class="btn small" id="print-plan">Print</button></div><div id="saved-plans"></div>
         </div>
+        <footer class="panel-footer"><a href="/methodology.html" target="_blank" rel="noopener">Data, assumptions &amp; limitations</a><span>Planning experiment · not emergency guidance</span></footer>
       </div>
     </section>
   </aside>
-
-  <div class="dock" id="dock">
-    <section class="card" style="--i:4">
-      <p class="eyebrow">Scenario</p>
-      <button class="btn bridge-btn" id="close-bridges" data-state="idle">
-        <span class="icon">
-          <svg class="i-bridge" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M1 6h14M3 6v6M13 6v6M3 6c1.5 2 3.5 3 5 3s3.5-1 5-3"/></svg>
-          <svg class="i-spin" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 1.5a6.5 6.5 0 1 0 6.5 6.5"/></svg>
-          <svg class="i-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 6.5 12 13 4.5"/></svg>
-        </span>
-        <span class="label"><span id="bridge-title">Close flooded bridges</span><span class="sub" id="bridge-sub">Simulates the rivers rising</span></span>
-      </button>
-      <div class="row">
-        <span class="closed-count" id="closed-count">0 roads closed</span>
-        <button class="btn small" id="open-all">Reopen all</button>
-      </div>
-      <div class="setting">
-        <label>Warning time</label>
-        <div class="seg" id="warning" role="group" aria-label="Warning time"><span class="thumb"></span>
-          <button data-warning="sudden" title="Flash flood or overnight surge: departures peak at 10 min, 95% gone by ~25 min">Sudden</button>
-          <button data-warning="short" title="A few hours of warning: departures peak at 25 min, 95% gone by ~1 h">Hours</button>
-          <button data-warning="long" title="Day-ahead order: departures peak at 75 min, 95% gone by ~3 h">A day</button>
-        </div>
-      </div>
-      <div class="row">
-        <label for="rate">Flood-zone households leaving</label>
-        <div class="slider">
-          <input type="range" id="rate" min="5" max="100" step="5">
-          <span class="cars-val" id="rate-val"></span>
-        </div>
-      </div>
-      <div class="slider-sub" id="rate-sub"></div>
-      <details class="schedule">
-        <summary>Evacuation schedule <span id="schedule-summary">All towns at once</span></summary>
-        <p class="schedule-note">Delay evacuation orders to keep neighboring towns from reaching the same bottleneck at once.</p>
-        <div class="schedule-head"><span>Town</span><span>Order</span><span>Leaving</span></div>
-        <div id="zone-schedule"></div>
-        <div class="schedule-presets">
-          <button class="btn small" id="stagger-schedule">Stagger by risk</button>
-          <button class="btn small" id="reset-schedule">Reset</button>
-        </div>
-      </details>
-      <div class="road-actions" id="road-actions"></div>
-      <div class="row">
-        <label for="shadow" title="Households within 200 m of a flood zone that leave even though they weren't told to">Neighbors leaving too</label>
-        <div class="slider">
-          <input type="range" id="shadow" min="0" max="100" step="5">
-          <span class="cars-val" id="shadow-val"></span>
-        </div>
-      </div>
-      <div class="slider-sub" id="shadow-sub"></div>
-    </section>
-    <section class="card" style="--i:5">
-      <p class="eyebrow" id="legend-title">Road load, queue ÷ capacity</p>
-      <div class="ramp"></div>
-      <div class="ramp-labels"><span id="legend-lo">Light</span><span id="legend-hi">Jammed</span></div>
-      <div class="keys">
-        <span><i class="sw flood"></i>FEMA special flood hazard area</span>
-        <span><i class="sw closed"></i>Closed road</span>
-        <span><i class="sw stranded"></i>Stranded cars, no dry route</span>
-      </div>
-    </section>
-    <div class="attrib">Roads © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · Basemap © Esri · FEMA NFHL · US Census TIGER</div>
-  </div>
-
-  <div class="toast-wrap" id="toasts" role="status" aria-live="polite"></div>
-  <div id="tooltip"></div>
-  <div class="loader" id="loader"><p class="shiny">Loading NJ-12 road network</p></div>
-
+  <details class="map-key card" id="map-key" open>
+    <summary>Map colors</summary><div class="keys"><span><i class="sw flood"></i>Blue: mapped flood zones</span><span><i class="sw closed"></i>Red dashed: closed roads</span><span><i class="sw stranded"></i>Red dots: cars without a route</span></div>
+    <p id="legend-title">Orange roads show traffic building up.</p><div class="ramp"></div><div class="ramp-labels"><span id="legend-lo">Light</span><span id="legend-hi">Jammed</span></div>
+  </details>
+  <div class="attrib">Roads © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · Basemap © Esri · FEMA NFHL · US Census TIGER</div>
+  <div class="toast-wrap" id="toasts" role="status" aria-live="polite"></div><div id="tooltip"></div><div class="loader" id="loader"><p>Loading the NJ-12 road network</p></div>
   <script type="module" src="/src/app.ts"></script>
 </body>
 </html>

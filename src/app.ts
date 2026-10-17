@@ -10,6 +10,7 @@ import { clickSpark, countUp } from "./bits.ts";
 import type { Warning } from "./sim.ts";
 import type { Command, FromWorker } from "./worker.ts";
 import type { NetworkJson, RoadAction, Snapshot, State, Stats, ZonePlan } from "./world.ts";
+import { staggerZones } from "./world.ts";
 
 type Rgb = [number, number, number];
 type Road = { i: number; path: [number, number][]; cls: string; name: string; flags: number; storage: number; town: number };
@@ -119,6 +120,12 @@ let selectedSeg: number | null = null;
 let selectedTown: number | null = null;
 let flash: { segs: number[]; on: boolean } = { segs: [], on: false };
 let version = 0;
+let guideStage: 0 | 1 | 2 | null = null;
+let guideRun: number | null = null;
+let pausedGuideStage: 0 | 1 | 2 | null = null;
+let guideLoading = false;
+let experience: "tour" | "explore" = "tour";
+const guideResults: Summary[] = [];
 
 const tooltip = $("tooltip");
 const spark = clickSpark($<HTMLCanvasElement>("sparks"));
@@ -214,18 +221,18 @@ function layers() {
   ];
 }
 
-const panelWidth = () => (innerWidth > 760 ? 400 : 0);
+const panelWidth = () => (innerWidth > 760 ? 440 : 0);
 const [minx, miny, maxx, maxy] = network.bounds;
 
 function fit(bounds: [[number, number], [number, number]], extra: { maxZoom?: number } = {}) {
   // fitBounds asserts if padding exceeds the viewport, which happens in a small window.
   const w = Math.max(innerWidth, 100), h = Math.max(innerHeight, 100);
   const padRight = Math.min(40 + panelWidth(), w * 0.45);
-  const padLeft = innerWidth > 760 ? Math.min(330, w * 0.3) : Math.min(20, w * 0.05);
+  const padLeft = innerWidth > 760 ? 40 : Math.min(20, w * 0.05);
   const pad = Math.min(70, h * 0.2);
   // On a phone the panel covers the bottom ~55% and the header stack the top 130px.
-  const top = innerWidth > 760 ? pad : Math.min(130, h * 0.2);
-  const bottom = innerWidth > 760 ? pad : Math.min(h * 0.57, h - top - 60);
+  const top = innerWidth > 760 ? Math.min(150, h * 0.25) : Math.min(130, h * 0.2);
+  const bottom = innerWidth > 760 ? pad : Math.min(h * 0.7 - 80, h - top - 60);
   return new WebMercatorViewport({ width: w, height: h }).fitBounds(bounds, {
     padding: { top, bottom, left: padLeft, right: padRight }, ...extra,
   });
@@ -257,8 +264,8 @@ function flyTo(target: { longitude: number; latitude: number; zoom: number }) {
 function centerOn(longitude: number, latitude: number, zoom: number) {
   const w = innerWidth, h = innerHeight;
   const wide = w > 760;
-  const cx = wide ? (Math.min(330, w * 0.3) + (w - panelWidth())) / 2 : w / 2;
-  const cy = wide ? h / 2 : (130 + h * 0.45) / 2;
+  const cx = wide ? (40 + (w - panelWidth())) / 2 : w / 2;
+  const cy = wide ? h / 2 : (130 + h * 0.3 + 80) / 2;
   const vp = new WebMercatorViewport({ width: w, height: h, longitude, latitude, zoom });
   const [lng, lat] = vp.unproject([w - cx, h - cy]);
   flyTo({ longitude: lng, latitude: lat, zoom });
@@ -294,7 +301,7 @@ function renderTooltip() {
         <dt>Routed through</dt><dd>${fmt(flow[r.i])} cars</dd>
         <dt>Delay caused</dt><dd>${d >= 60 ? `${(d / 60).toFixed(1)} veh-h` : `${fmt(d)} veh-min`}</dd>
       </dl>
-      <div class="act">Click to ${isClosed ? "reopen" : "close"} this road</div>`;
+      <div class="act">${experience === "tour" ? "Switch to Explore to edit roads" : `Click to ${isClosed ? "reopen" : "close"} this road`}</div>`;
   }
   const pad = 14;
   const w = tooltip.offsetWidth, h = tooltip.offsetHeight;
@@ -334,6 +341,7 @@ function flashSegments(segs: number[]) {
 const rerouted = (n: number) => (n ? `${fmt(n)} driver${n === 1 ? "" : "s"} rerouted` : "no current routes used it");
 
 async function toggleRoad({ object, x, y, layer }: PickingInfo) {
+  if (experience === "tour") return;
   if (!object || layer?.id !== "roads") return;
   const road = object as Road;
   const closing = !closed.has(road.i);
@@ -364,8 +372,8 @@ function renderBridgeButton() {
   const n = floodedBridges.length;
   const allClosed = floodedBridges.every((i) => closed.has(i));
   bridgeBtn.dataset.state = allClosed ? "closed" : "idle";
-  $("bridge-title").textContent = allClosed ? `${n} flooded bridges closed` : `Close ${n} flooded bridges`;
-  $("bridge-sub").textContent = allClosed ? "Click to reopen them" : "Simulates the rivers rising";
+  $("bridge-title").textContent = allClosed ? `${n} crossing segments closed` : `Close ${n} crossing segments`;
+  $("bridge-sub").textContent = allClosed ? "Click to reopen them" : "Bridges intersecting mapped flood zones";
 }
 
 bridgeBtn.onclick = async () => {
@@ -388,7 +396,7 @@ bridgeBtn.onclick = async () => {
     bridgeBtn.classList.add("pop");
     if (closing) flashSegments(floodedBridges);
     else redraw();
-    toast(closing ? "closed" : "open", `${closing ? "Closed" : "Reopened"} ${fmt(result.changed)} flooded bridges`,
+    toast(closing ? "closed" : "open", `${closing ? "Closed" : "Reopened"} ${fmt(result.changed)} bridge segments`,
       closing ? rerouted(result.affected) : "");
     refreshStats();
   } catch (err) {
@@ -446,10 +454,13 @@ function applySnapshot(s: Snapshot) {
   for (const k of COUNTER_KEYS) counters[k].set(s.counts[k]);
   $("stranded-tile").dataset.alert = String(s.counts.stranded > 0);
   $("clock").textContent = fmtClock(s.t);
-  $("pct").textContent = `${Math.floor(pct)}% out`;
+  $("pct").textContent = `${Math.floor(pct)}% of cars out`;
   $("progress").style.width = `${pct}%`;
   $("closed-count").textContent = `${fmt(closed.size)} road${closed.size === 1 ? "" : "s"} closed`;
   $("closed-count").classList.toggle("active", closed.size > 0);
+  $("road-setting").textContent = closed.size ? `${fmt(closed.size)} closed` : roadActions.length ? `${roadActions.length} scheduled` : "All roads open";
+  document.body.dataset.complete = String(s.done);
+  if (guideStage !== null) renderWatchNote();
 
   const state = s.done ? "done" : s.running ? "running" : "paused";
   $("status").dataset.state = state;
@@ -461,6 +472,7 @@ function applySnapshot(s: Snapshot) {
   renderResult();
   renderSpeed(s.speed);
   renderBridgeButton();
+  $<HTMLButtonElement>("play").disabled = guideStage !== null && (guideLoading || s.done);
   if (activeTab === "overview") renderChart(chartHover);
   redraw();
   if (hovered) renderTooltip();
@@ -471,6 +483,7 @@ function renderResult() {
   const el = $("result");
   const sum = stats?.summary;
   if (!snap.done || !sum || stats!.run !== snap.run) {
+    el.hidden = true;
     el.classList.remove("show");
     return;
   }
@@ -479,6 +492,7 @@ function renderResult() {
   if (sum.stranded) html += ` · <strong>${fmt(sum.stranded)}</strong> stranded`;
   if (sum.worst_road) html += ` · worst jam on <strong>${escapeHtml(sum.worst_road)}</strong>`;
   $("result-text").innerHTML = html;
+  el.hidden = false;
   el.classList.add("show");
 }
 
@@ -549,13 +563,22 @@ let statsInFlight = false;
 async function refreshStats() {
   if (statsInFlight) return;
   statsInFlight = true;
+  const requestedExperience = experience;
   let next: Stats;
   try {
     next = await call<Stats>({ cmd: "stats" });
   } finally {
     statsInFlight = false;
   }
+  if (requestedExperience !== experience || next.run !== snap.run || (snap.done && !next.summary.done)) {
+    void refreshStats();
+    return;
+  }
   stats = next;
+  if (guideStage !== null && !guideLoading && next.run === guideRun && next.run === snap.run && next.summary.done) {
+    guideResults[guideStage] = next.summary;
+    renderGuide();
+  }
   delayMin.fill(0);
   flow.fill(0);
   next.delay.segs.forEach((seg, k) => { delayMin[seg] = next.delay.veh_min[k]; });
@@ -577,6 +600,9 @@ async function refreshStats() {
   $("m-median").innerHTML = tile(sum.median_min, "min");
   $("m-delay").innerHTML = tile(sum.mean_delay_min, "min");
   $("m-vh").innerHTML = tile(sum.delay_veh_h, "veh-h");
+  $("outcome-hint").textContent = snap.t === 0 ? "Run the simulation to see the outcome for participating flood-zone cars."
+    : sum.done ? "Run complete. Check both time and cars without a route before deciding whether this plan helped."
+    : "Simulation in progress. These results will update as cars reach exits.";
   $("compare-badge").hidden = !next.previous;
 
   renderLegend();
@@ -591,7 +617,8 @@ setInterval(() => { if (snap.running) refreshStats(); }, 1000);
 function renderDemand(d: State["demand"]) {
   $("d-people").textContent = fmt(d.people);
   $("d-households").textContent = fmt(d.households);
-  $("d-cars").innerHTML = d.shadow_cars ? `${fmt(d.cars)}<small>+${fmt(d.shadow_cars)} nbrs</small>` : fmt(d.cars);
+  $("d-cars").textContent = fmt(d.cars);
+  $("tour-people").textContent = fmt(d.people);
   $("d-novehicle").innerHTML = `${fmt(d.no_vehicle)}<small>households</small>`;
   $("d-note").innerHTML = `<strong>${fmt(d.no_vehicle_people)}</strong> people live in flood-zone households with no vehicle. `
     + `They aren't in the traffic sim and need buses or rides out. One car per household with a vehicle.`;
@@ -601,6 +628,9 @@ function renderDemand(d: State["demand"]) {
 
 function renderBottlenecks() {
   const list = $("bottlenecks");
+  // Keep an open editor stable while live statistics arrive.
+  if (list.dataset.run === String(stats?.run) && list.querySelector(".closure-plan[open]")) return;
+  list.dataset.run = String(stats?.run);
   const rows = stats?.bottlenecks ?? [];
   if (!rows.length) {
     list.innerHTML = '<div class="empty">No delay yet. Run the simulation to see where traffic backs up.</div>';
@@ -626,15 +656,16 @@ function renderBottlenecks() {
         <div class="bar"><i style="width:${(100 * b.delay_veh_h) / top}%"></i></div>
       </div>
       <div class="row-val"><b>${b.delay_veh_h.toFixed(1)} veh-h</b><span>${fmt(b.queued)} queued · ${fmt(b.flow)} routed</span></div>
-      <div class="closure-plan"><select aria-label="Action for ${escapeHtml(roadLabel(r))}">${option("close", "Close")}${option("half", "50% capacity")}${option("boost", "150% capacity")}</select><input type="number" min="0" max="300" step="5" value="${Math.round((action?.startsAtS ?? 1800) / 60)}" aria-label="Action time for ${escapeHtml(roadLabel(r))} in minutes"><button class="btn" data-schedule="${b.seg}">${action ? "Update" : "Schedule"}</button></div>
+      <details class="closure-plan"><summary>Test a change on this road</summary><label>Action <select aria-label="Action for ${escapeHtml(roadLabel(r))}">${option("close", "Close")}${option("half", "Half capacity")}${option("boost", "50% more capacity")}</select></label><label>Minutes after the run starts <input type="number" min="0" max="300" step="5" value="${Math.round((action?.startsAtS ?? 1800) / 60)}" aria-label="Action time for ${escapeHtml(roadLabel(r))} in minutes"></label><p class="micro">Capacity is how many cars can pass each hour. Scheduling restarts the run.</p><button class="btn" data-schedule="${b.seg}">${action ? "Update" : "Schedule change"}</button></details>
     </div>`;
   }).join("");
   for (const row of list.querySelectorAll<HTMLElement>(".list-row")) {
     const go = () => focusSegment(Number(row.dataset.seg));
     row.onclick = (e) => { if (!(e.target as HTMLElement).closest(".closure-plan")) go(); };
-    row.onkeydown = (e) => { if (e.key === "Enter") go(); };
+    row.onkeydown = (e) => { if (e.key === "Enter" && e.target === row) go(); };
   }
   for (const button of list.querySelectorAll<HTMLButtonElement>("[data-schedule]")) {
+    button.disabled = guideStage !== null;
     button.onclick = async () => {
       const segment = Number(button.dataset.schedule);
       const input = button.parentElement!.querySelector<HTMLInputElement>("input")!;
@@ -645,6 +676,7 @@ function renderBottlenecks() {
         multiplier: choice === "half" ? 0.5 : choice === "boost" ? 1.5 : undefined });
       toast("closed", `${roadLabel(roads[segment])} action scheduled`, `${Math.round(startsAtS / 60)} minutes after the run starts`);
       renderRoadActions();
+      button.closest("details")!.open = false;
       await changeScenario();
       renderBottlenecks();
     };
@@ -654,8 +686,9 @@ function renderBottlenecks() {
 function focusSegment(seg: number) {
   selectedSeg = selectedSeg === seg ? null : seg;
   if (selectedSeg != null) {
-    const b = stats!.bottlenecks.find((x) => x.seg === seg)!;
-    centerOn(b.at[0], b.at[1], 15.5);
+    const road = roads[seg];
+    const at = road.path[Math.floor(road.path.length / 2)];
+    centerOn(at[0], at[1], 15.5);
     if (mode !== "delay") setMode("delay");
   }
   renderBottlenecks();
@@ -726,13 +759,13 @@ type NumericKey = { [K in keyof Summary]: Summary[K] extends number | null ? K :
 const COMPARE_ROWS: [string, NumericKey, string, number][] = [
   ["50% out by", "t50_min", "min", -1],
   ["90% out by", "t90_min", "min", -1],
-  ["Last one out", "cleared_min", "min", -1],
-  ["Stranded, flood zone", "stranded", "cars", -1],
+  ["Last successful arrival", "cleared_min", "min", -1],
+  ["No route, flood zone", "stranded", "cars", -1],
   ["Stranded, all", "stranded_all", "cars", -1],
   ["Median trip", "median_min", "min", -1],
   ["90th pct trip", "p90_min", "min", -1],
-  ["Avg delay per car", "mean_delay_min", "min", -1],
-  ["Total delay", "delay_veh_h", "veh-h", -1],
+  ["Extra time per car", "mean_delay_min", "min", -1],
+  ["Combined queue delay", "delay_veh_h", "car-hours", -1],
   ["Roads closed", "closed", "", 0],
   ["Scheduled closures", "scheduled_closures", "", 0],
   ["Households leaving", "rate", "%", 0],
@@ -748,8 +781,10 @@ function renderCompare() {
   const cur = stats?.summary, prev = stats?.previous;
   $("compare-empty").hidden = !!prev;
   $("compare").hidden = !prev;
+  $("compare-details").hidden = !prev;
+  renderSavedPlans();
   if (!cur || !prev) return;
-  const show = (v: number | null, unit: string) => (v == null ? '<span class="dim">—</span>' : unit === "min" ? minutes(v) : fmt(v));
+  const show = (v: number | null, unit: string) => (v == null ? '<span class="dim">—</span>' : unit === "min" ? minutes(v) : unit === "car-hours" ? v.toFixed(1) : fmt(v));
   const rows = COMPARE_ROWS.map(([label, key, unit, better]) => {
     const a = cur[key], b = prev[key];
     let change = '<span class="dim">—</span>';
@@ -759,19 +794,25 @@ function renderCompare() {
         change = '<span class="dim">same</span>';
       } else {
         const tone = better === 0 ? "" : Math.sign(d) === better ? "better" : "worse";
-        const size = unit === "min" ? Math.abs(d).toFixed(1) : fmt(Math.abs(d));
+        const size = unit === "min" || unit === "car-hours" ? Math.abs(d).toFixed(1) : fmt(Math.abs(d));
         change = `<span class="delta ${tone}">${d > 0 ? ARROW_UP : ARROW_DOWN}${d > 0 ? "+" : "−"}${size}</span>`;
       }
     }
-    return `<tr><td>${label}${unit ? ` <span class="dim">${unit}</span>` : ""}</td>
+    const detail = !["t90_min", "stranded", "mean_delay_min", "delay_veh_h"].includes(key);
+    return `<tr data-detail="${detail}"><td>${label}${unit ? ` <span class="dim">${unit}</span>` : ""}</td>
       <td class="r num">${show(a, unit)}</td><td class="r num">${show(b, unit)}</td><td class="r">${change}</td></tr>`;
   });
   const road = (v: string | null) => `<td class="r text" title="${escapeHtml(v ?? "")}">${escapeHtml(v ?? "—")}</td>`;
-  rows.push(`<tr><td>Warning time</td><td class="r">${WARNING_LABEL[cur.warning]}</td><td class="r">${WARNING_LABEL[prev.warning] ?? "—"}</td><td></td></tr>`);
-  rows.push(`<tr><td>Worst bottleneck</td>${road(cur.worst_road)}${road(prev.worst_road)}<td></td></tr>`);
+  rows.push(`<tr data-detail="true"><td>Warning time</td><td class="r">${WARNING_LABEL[cur.warning]}</td><td class="r">${WARNING_LABEL[prev.warning] ?? "—"}</td><td></td></tr>`);
+  rows.push(`<tr data-detail="true"><td>Worst bottleneck</td>${road(cur.worst_road)}${road(prev.worst_road)}<td></td></tr>`);
   $("compare").querySelector("tbody")!.innerHTML = rows.join("");
-  renderSavedPlans();
 }
+
+$("compare-details").onclick = () => {
+  const expanded = $("compare").classList.toggle("show-details");
+  $("compare-details").setAttribute("aria-expanded", String(expanded));
+  $("compare-details").textContent = expanded ? "Show key outcomes only" : "Show all metrics and settings";
+};
 
 function renderSavedPlans() {
   const list = $("saved-plans");
@@ -789,6 +830,7 @@ function renderSavedPlans() {
   </div>`).join("");
   for (const button of list.querySelectorAll<HTMLButtonElement>("[data-load-plan]")) {
     button.onclick = async () => {
+      if (guideStage !== null) return;
       const plan = savedPlans[Number(button.dataset.loadPlan)];
       rate.value = String(plan.rate);
       shadow.value = String(plan.shadow);
@@ -815,9 +857,9 @@ function renderSavedPlans() {
 // Map layer switch and legend
 
 const LEGENDS: Record<Mode, [string, () => string, () => string]> = {
-  queues: ["Road load, queue ÷ capacity", () => "Light", () => "Jammed"],
-  delay: ["Delay caused, vehicle-minutes (log)", () => "1", () => fmt(maxDelay)],
-  routes: ["Cars routed through, current plan (log)", () => "1", () => fmt(maxFlow)],
+  queues: ["Orange roads show traffic building up.", () => "More space", () => "Full road"],
+  delay: ["Brighter roads caused more waiting. Scale is compressed to show smaller jams too.", () => "1 car-minute", () => `${fmt(maxDelay)} car-min`],
+  routes: ["Brighter roads have more cars still planning to use them. Scale is compressed.", () => "1 car", () => `${fmt(maxFlow)} cars`],
 };
 
 function renderLegend() {
@@ -849,12 +891,22 @@ for (const b of $("modes").querySelectorAll<HTMLElement>("button")) b.onclick = 
 function setTab(name: Tab) {
   activeTab = name;
   const buttons = [...$("tabbar").querySelectorAll<HTMLElement>("button")];
-  buttons.forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === name)));
+  buttons.forEach((b) => {
+    b.setAttribute("aria-selected", String(b.dataset.tab === name));
+    b.tabIndex = b.dataset.tab === name ? 0 : -1;
+    b.id = `tab-${b.dataset.tab}`;
+    b.setAttribute("aria-controls", `panel-${b.dataset.tab}`);
+  });
   const btn = buttons.find((b) => b.dataset.tab === name)!;
   const line = $("tabbar").querySelector<HTMLElement>(".underline")!;
   line.style.width = `${btn.offsetWidth - 20}px`;
   line.style.transform = `translateX(${btn.offsetLeft + 10}px)`;
-  for (const p of document.querySelectorAll<HTMLElement>(".tab-panel")) p.hidden = p.dataset.panel !== name;
+  for (const p of document.querySelectorAll<HTMLElement>(".tab-panel")) {
+    p.hidden = p.dataset.panel !== name;
+    p.id = `panel-${p.dataset.panel}`;
+    p.setAttribute("role", "tabpanel");
+    p.setAttribute("aria-labelledby", `tab-${p.dataset.panel}`);
+  }
   if (name !== "towns") selectedTown = null;
   if (name !== "bottlenecks") selectedSeg = null;
   if (name === "overview") renderChart();
@@ -864,6 +916,17 @@ function setTab(name: Tab) {
   redraw();
 }
 for (const b of $("tabbar").querySelectorAll<HTMLElement>("button")) b.onclick = () => setTab(b.dataset.tab as Tab);
+$("tabbar").onkeydown = (event) => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const tabs = [...$("tabbar").querySelectorAll<HTMLButtonElement>("button")];
+  const current = tabs.findIndex((tab) => tab.dataset.tab === activeTab);
+  const index = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+    : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+  setTab(tabs[index].dataset.tab as Tab);
+  tabs[index].focus();
+};
+$("chart-details").addEventListener("toggle", () => renderChart());
 
 // Run controls
 
@@ -889,7 +952,12 @@ let warning: Warning = initial.demand.warning;
 let zonePlans: ZonePlan[] = initial.demand.zones.map((zone) => ({ ...zone }));
 let roadActions: RoadAction[] = [];
 function renderRoadActions() {
-  $("road-actions").innerHTML = roadActions.map((action, index) => {
+  $("road-setting").textContent = closed.size ? `${fmt(closed.size)} closed` : roadActions.length ? `${roadActions.length} scheduled` : "All roads open";
+  if (roadActions.length > 20) {
+    $("road-actions").innerHTML = `<details><summary>${roadActions.length} scheduled road actions</summary><div id="road-action-list"></div></details>`;
+  }
+  const actionList = roadActions.length > 20 ? $("road-action-list") : $("road-actions");
+  actionList.innerHTML = roadActions.map((action, index) => {
     const label = action.kind === "capacity" ? `${Math.round((action.multiplier ?? 1) * 100)}% capacity` : "close";
     return `<div class="road-action"><span>${escapeHtml(roadLabel(roads[action.segment]))}</span><span>${label} at ${Math.round(action.startsAtS / 60)}m</span><button class="btn small" data-remove-action="${index}" aria-label="Remove action">×</button></div>`;
   }).join("");
@@ -901,7 +969,11 @@ function renderRoadActions() {
     };
   }
 }
-const togglePlay = () => call({ cmd: snap.running ? "pause" : "play" });
+const togglePlay = () => {
+  if (experience === "tour" && guideStage === null) return;
+  if (guideStage !== null && (guideLoading || snap.done)) return;
+  return call({ cmd: snap.running ? "pause" : "play" });
+};
 const resetRun = () => call({
   cmd: "reset", rate: Number(rate.value), shadow: Number(shadow.value), warning, zones: zonePlans, roadActions,
 });
@@ -914,6 +986,8 @@ shadow.value = String(initial.demand.shadow);
 function renderSchedule() {
   const changed = zonePlans.filter((zone) => zone.orderTimeS > 0 || zone.participation !== Number(rate.value)).length;
   $("schedule-summary").textContent = changed ? `${changed} town${changed === 1 ? "" : "s"} changed` : "All towns at once";
+  $("people-setting").textContent = new Set(zonePlans.map((zone) => zone.participation)).size > 1 ? "Varies by town" : `${rate.value}% of households with cars`;
+  renderWarning();
   $("zone-schedule").innerHTML = zonePlans.map((zone) => `<div class="zone-row" data-town="${zone.town}">
     <label title="${escapeHtml(townNames[zone.town])}">${escapeHtml(shortTown(zone.town))}</label>
     <span class="field"><input data-field="order" type="number" min="0" max="180" step="5" value="${zone.orderTimeS / 60}" aria-label="${escapeHtml(shortTown(zone.town))} order time in minutes"><span class="unit">m</span></span>
@@ -934,6 +1008,7 @@ function renderSchedule() {
 const showSliders = () => {
   $("rate-val").textContent = `${rate.value}%`;
   $("shadow-val").textContent = `${shadow.value}%`;
+  $("people-setting").textContent = `${rate.value}% leave · ${shadow.value}% of neighbors`;
 };
 showSliders();
 rate.oninput = shadow.oninput = showSliders;
@@ -982,9 +1057,7 @@ $("export-plans").onclick = () => {
 };
 $("print-plan").onclick = () => print();
 $("stagger-schedule").onclick = () => {
-  const ranked = [...zonePlans].sort((a, b) => network.demand.no_vehicle[b.town] - network.demand.no_vehicle[a.town]);
-  const tierSize = Math.ceil(ranked.length / 4);
-  ranked.forEach((zone, index) => { zone.orderTimeS = Math.floor(index / tierSize) * 15 * 60; });
+  staggerZones(zonePlans, network.demand.no_vehicle);
   renderSchedule();
   changeScenario();
 };
@@ -994,22 +1067,198 @@ function renderWarning() {
   const buttons = [...warningSeg.querySelectorAll<HTMLElement>("button")];
   buttons.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.warning === warning)));
   placeThumb(warningSeg, buttons.find((b) => b.dataset.warning === warning));
+  const departure = { sudden: "25 minutes", short: "about an hour", long: "about three hours" }[warning];
+  $("warning-explanation").textContent = `About 95% are ready to depart within ${departure} of their town’s order. These are assumed response times.`;
+  $("departure-setting").textContent = zonePlans.some((zone) => zone.orderTimeS > 0) ? "Orders vary by town" : `Depart over ${departure}`;
 }
 for (const b of warningSeg.querySelectorAll<HTMLElement>("button")) {
   b.onclick = () => { warning = b.dataset.warning as Warning; renderWarning(); changeScenario(); };
 }
 
+const guideTitles = ["First, let everyone leave.", "Now, take away some routes.", "Would leaving in waves help?"];
+const guideDescriptions = [
+  "Every town receives its order at the same time. Roads stay open. This gives us a baseline to compare against.",
+  "Close the flood-zone crossings after 30 minutes. Keep the same cars and departure times so we can isolate the effect.",
+  "Keep the closures. Give towns orders in four waves, 15 minutes apart. Less simultaneous traffic sounds helpful. Is it?",
+];
+
+function renderWatchNote() {
+  const note = $("guide-observe");
+  note.hidden = guideStage === null || snap.done;
+  if (guideStage === null) return;
+  note.textContent = guideStage === 0 ? "Watch the orange roads: brighter means more traffic. The clock runs faster than real time."
+    : guideStage === 1 ? snap.t < 1800 ? "Watch for red crossings at minute 30. Cars will have to find another way."
+      : "The crossings are closed. Red dots mark cars that have no route to an exit."
+    : "Later orders may mean less traffic, but some crossings can close before a town leaves.";
+}
+
+function renderGuide() {
+  const active = guideStage !== null;
+  const complete = guideStage !== null && !!guideResults[guideStage];
+  document.body.dataset.view = experience;
+  document.body.dataset.started = String(experience === "explore" || active);
+  document.body.dataset.complete = String(snap.done);
+  $("dock").inert = active;
+  $("saved-plans").inert = active;
+  $("save-plan").parentElement!.inert = active;
+  $<HTMLButtonElement>("reset").disabled = active;
+  $<HTMLButtonElement>("play").disabled = active && (guideLoading || snap.done);
+  for (const view of ["tour", "explore"] as const) {
+    const button = $<HTMLButtonElement>(`view-${view}`);
+    button.setAttribute("aria-pressed", String(experience === view));
+    button.disabled = guideLoading;
+  }
+  $("guide-exit").hidden = !active || (guideStage === 2 && complete);
+  $("guide-intro").hidden = active;
+  $("guide-setup").hidden = !active;
+  $("guide-kicker").textContent = active ? `Experiment ${guideStage! + 1} of 3 · hypothetical` : "Three quick experiments";
+  const next = $<HTMLButtonElement>("guide-next");
+  next.disabled = guideLoading || (active && !complete);
+  next.hidden = active && !complete && !guideLoading;
+  next.textContent = !active ? "Start with open roads" : guideLoading ? "Preparing run…"
+    : guideStage === 0 ? "Now close the crossings" : guideStage === 1 ? "Try staggered orders" : "Try your own plan";
+  $("guide-title").textContent = guideStage !== null ? guideTitles[guideStage] : "Can everyone get out before roads close?";
+  $("guide-description").textContent = guideStage !== null ? guideDescriptions[guideStage]
+    : "Try three evacuation plans on real New Jersey roads. See how a small change can leave more cars without a way out.";
+  $("guide-footnote").textContent = active ? "Same cars in every run. These closures are hypothetical, not predicted bridge failures."
+    : snap.t > 0 ? "Starting the tour replaces the current scenario. Your saved results stay."
+    : "Real road and Census data. Hypothetical closures. This is an experiment, not a flood forecast.";
+  for (const [index, step] of [...document.querySelectorAll<HTMLElement>(".tour-steps li")].entries()) {
+    if (index === guideStage) step.setAttribute("aria-current", "step");
+    else step.removeAttribute("aria-current");
+    step.dataset.done = String(!!guideResults[index]);
+  }
+  if (active) {
+    $("guide-setup").innerHTML = `<div><dt>Town orders</dt><dd>${guideStage === 2 ? "0, 15, 30, 45 minutes" : "All at minute 0"}</dd></div>
+      <div><dt>Roads</dt><dd>${guideStage === 0 ? "All open" : `${fmt(floodedBridges.length)} bridge segments close at 30 min`}</dd></div>`;
+  }
+  renderWatchNote();
+  const results = $("guide-results");
+  if (!complete || guideStage === null) { results.replaceChildren(); return; }
+  const outcome = guideResults[guideStage];
+  const before = guideStage > 0 ? guideResults[guideStage - 1] : null;
+  const timeChange = before && outcome.t90_min !== null && before.t90_min !== null ? outcome.t90_min - before.t90_min : null;
+  const timeDelta = timeChange === null ? "" : Math.abs(timeChange) < 0.05 ? "Same as previous run"
+    : `${Math.abs(timeChange).toFixed(1)} min ${timeChange > 0 ? "slower" : "faster"} than before`;
+  const strandedChange = before ? outcome.stranded - before.stranded : null;
+  const strandedDelta = strandedChange === null ? "" : strandedChange === 0 ? "Same as previous run"
+    : `${fmt(Math.abs(strandedChange))} ${strandedChange > 0 ? "more" : "fewer"} than before`;
+  const insight = guideStage === 0 ? "This is our baseline. Next, test what happens when crossings close."
+    : guideStage === 1 ? outcome.stranded > 0 ? "Most cars still get out. The red dots show where the plan fails." : "Every participating car found an exit under these assumptions."
+    : strandedChange !== null && strandedChange > 0 ? "Delaying some orders left more cars without a route. Staggering is not always better."
+    : "Judge the schedule by both travel time and cars without a route.";
+  const row = (label: string, values: string[]) => `<tr><th scope="row">${label}</th>${values.map((v) => `<td>${v}</td>`).join("")}</tr>`;
+  results.innerHTML = `<div class="guide-result-cards"><div><strong>${outcome.t90_min === null ? "Not reached" : `${minutes(outcome.t90_min)} min`}</strong><span>to get 90% of cars out</span><small>${timeDelta}</small></div>
+    <div><strong>${fmt(outcome.stranded)}</strong><span>cars without a route</span><small>${strandedDelta}</small></div></div>
+    <p class="guide-conclusion">${insight}</p>
+    <details class="explanation"><summary>See the numbers side by side</summary><table><caption>Participating flood-zone cars</caption>
+    <thead><tr><th scope="col">Metric</th>${["Open", "Closed", "Waves"].slice(0, guideResults.length).map((label) => `<th scope="col">${label}</th>`).join("")}</tr></thead>
+    <tbody>${row("90% out (min)", guideResults.map((s) => minutes(s.t90_min)))}
+    ${row("No route (cars)", guideResults.map((s) => fmt(s.stranded)))}
+    ${row("Queue delay (hours)", guideResults.map((s) => s.delay_veh_h?.toFixed(1) ?? "—"))}</tbody></table>
+    <p>Queue delay adds up waiting across all cars, including neighbors. One hour can mean 60 cars each waiting one minute.</p></details>`;
+}
+
+async function setExperience(view: "tour" | "explore") {
+  if (guideLoading || experience === view) return;
+  guideLoading = true;
+  renderGuide();
+  try {
+    await call({ cmd: "pause" });
+    if (experience === "tour") pausedGuideStage = guideStage;
+    guideStage = null;
+    const session = await call<{ state: State; roadActions: RoadAction[] }>({ cmd: "experience", view });
+    experience = view;
+    guideStage = view === "tour" ? pausedGuideStage : null;
+    rate.value = String(session.state.demand.rate);
+    shadow.value = String(session.state.demand.shadow);
+    warning = session.state.demand.warning;
+    zonePlans = session.state.demand.zones.map((zone) => ({ ...zone }));
+    roadActions = session.roadActions;
+    runs.current = { id: session.state.run, points: toPoints(session.state.history, session.state.total) };
+    runs.previous = session.state.previous
+      ? { points: toPoints(session.state.previous.points, session.state.previous.total) } : null;
+    stats = null;
+    applySnapshot(session.state);
+    renderDemand(session.state.demand);
+    showSliders();
+    renderSchedule();
+    renderRoadActions();
+  } finally {
+    guideLoading = false;
+    renderGuide();
+  }
+  await refreshStats();
+  setTab("overview");
+  setMode("queues");
+  renderSavedPlans();
+  document.querySelector(".tab-body")!.scrollTop = 0;
+  $("panel").scrollTop = 0;
+  const fitted = fit([[minx, miny], [maxx, maxy]]);
+  flyTo({ longitude: fitted.longitude, latitude: fitted.latitude, zoom: fitted.zoom });
+}
+const welcome = $<HTMLDialogElement>("welcome");
+$("welcome-start").onclick = () => welcome.close();
+welcome.showModal();
+
+$("view-tour").onclick = () => setExperience("tour");
+$("view-explore").onclick = () => setExperience("explore");
+
+$("guide-next").onclick = async () => {
+  if (guideStage === 2 && guideResults.length === 3) { await setExperience("explore"); return; }
+  guideStage = guideStage === null ? 0 : guideStage === 0 ? 1 : 2;
+  if (guideStage === 0) guideResults.length = 0;
+  guideLoading = true;
+  renderGuide();
+  $<HTMLButtonElement>("guide-exit").disabled = true;
+  try {
+    await call({ cmd: "pause" });
+    const preset = await call<{ state: State; roadActions: RoadAction[] }>({ cmd: "example", stage: guideStage });
+    guideRun = preset.state.run;
+    rate.value = String(preset.state.demand.rate);
+    shadow.value = String(preset.state.demand.shadow);
+    warning = preset.state.demand.warning;
+    zonePlans = preset.state.demand.zones.map((zone) => ({ ...zone }));
+    roadActions = preset.roadActions;
+    showSliders();
+    renderWarning();
+    renderSchedule();
+    renderRoadActions();
+    setTab("overview");
+    setMode("queues");
+    const fitted = fit([[minx, miny], [maxx, maxy]]);
+    flyTo({ longitude: fitted.longitude, latitude: fitted.latitude, zoom: fitted.zoom });
+    await call({ cmd: "speed", steps: initial.speeds[initial.speeds.length - 1] });
+    await call({ cmd: "play" });
+    document.querySelector(".tab-body")!.scrollTop = 0;
+    $("panel").scrollTop = 0;
+  } catch (err) {
+    guideStage = null;
+    guideRun = null;
+    toast("error", "Couldn't start the experiment", (err as Error).message);
+  } finally {
+    guideLoading = false;
+    $<HTMLButtonElement>("guide-exit").disabled = false;
+    renderGuide();
+  }
+};
+$("guide-exit").onclick = () => setExperience("explore");
+
 addEventListener("keydown", (e) => {
-  if (e.target instanceof HTMLInputElement) return;
+  if (welcome.open) return;
+  if (e.target instanceof HTMLElement && e.target.closest("input, select, button, summary, a")) return;
   if (e.code === "Space") { e.preventDefault(); togglePlay(); }
-  if (e.key === "r" && !e.metaKey && !e.ctrlKey) resetRun();
+  if (e.key === "r" && !e.metaKey && !e.ctrlKey && experience === "explore") resetRun();
 });
 
-// On a phone the dock can't float beside the panel, so it joins the panel's scroll.
 const narrow = matchMedia("(max-width: 760px)");
-const placeDock = () => (narrow.matches ? document.querySelector(".tab-body")! : document.body).append($("dock"));
-narrow.addEventListener("change", placeDock);
-placeDock();
+const placeLegend = () => { $<HTMLDetailsElement>("map-key").open = !narrow.matches; };
+narrow.addEventListener("change", () => {
+  placeLegend();
+  const fitted = fit([[minx, miny], [maxx, maxy]]);
+  flyTo({ longitude: fitted.longitude, latitude: fitted.latitude, zoom: fitted.zoom });
+});
+placeLegend();
 
 for (const k of COUNTER_KEYS) counters[k].set(initial.counts[k], { instant: true });
 applySnapshot(initial);
@@ -1019,6 +1268,7 @@ setTab("overview");
 renderDemand(initial.demand);
 renderSchedule();
 renderRoadActions();
+renderGuide();
 await refreshStats();
 addEventListener("resize", () => { renderSpeed(snap.speed); renderWarning(); setMode(mode); setTab(activeTab); });
 

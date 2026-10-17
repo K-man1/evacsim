@@ -12,6 +12,12 @@ export interface ZonePlan {
   participation: number;
 }
 
+export function staggerZones(zones: ZonePlan[], noVehicle: number[]) {
+  const ranked = [...zones].sort((a, b) => noVehicle[b.town] - noVehicle[a.town]);
+  const tierSize = Math.ceil(ranked.length / 4);
+  ranked.forEach((zone, index) => { zone.orderTimeS = Math.floor(index / tierSize) * 15 * 60; });
+}
+
 export interface RoadAction {
   segment: number;
   startsAtS: number;
@@ -279,6 +285,18 @@ export class World {
     this.runClosed = this.closedSegments().length;
     this.runId++;
     this.running = false;
+  }
+
+  loadExample(stage: 0 | 1 | 2) {
+    const zones = this.meta.towns.map((_, town) => ({ town, orderTimeS: 0, participation: 100 }))
+      .filter((zone) => this.meta.demand.households[zone.town] >= 0.5);
+    if (stage === 2) staggerZones(zones, this.meta.demand.no_vehicle);
+    const actions: RoadAction[] = stage === 0 ? [] : this.floodedBridges().map((segment) => ({
+      segment, startsAtS: 30 * 60, kind: "close",
+    }));
+    this.reset(100, 20, "short", zones, actions);
+    this.setSegments(this.closedSegments(), false);
+    return { state: this.state(), roadActions: this.roadActions };
   }
 
   setSegments(segs: number[], closed: boolean) {
